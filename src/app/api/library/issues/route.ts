@@ -76,7 +76,11 @@ export async function GET(request: Request) {
             ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
             select: {
                 id: true, number: true, name: true, coverUrl: true, releaseDate: true, filePath: true,
-                series: { select: { name: true, publisher: true, year: true, folderPath: true } }
+                // Requesting from this view needs what the series page has in hand: the series'
+                // provider identity, and the issue's domain (annual / collected) for the composite.
+                isAnnual: true,
+                attachedVolume: { select: { kind: true, name: true } },
+                series: { select: { name: true, publisher: true, year: true, folderPath: true, metadataId: true, metadataSource: true } }
             }
         });
 
@@ -91,17 +95,29 @@ export async function GET(request: Request) {
             // its own archive's first page (the route falls back to the series cover internally).
             else if (!cover && i.filePath) cover = `/api/library/cover?issueId=${encodeURIComponent(i.id)}`;
             else if (!cover && i.series?.folderPath) cover = `/api/library/cover?path=${encodeURIComponent(i.series.folderPath)}`;
+            const onDisk = !!(i.filePath && i.filePath.trim().length > 0);
+            const seriesMetadataId: string | null = i.series?.metadataId ?? null;
+            // A request is filed against the series' provider volume, so a missing issue is only
+            // requestable when the series is genuinely matched — a placeholder "unmatched_*" id has
+            // nothing to search for and would only produce a request that can never resolve.
+            const requestable = !onDisk && !!seriesMetadataId && !seriesMetadataId.startsWith('unmatched_');
             return {
                 id: i.id,
                 number: i.number,
                 name: i.name,
                 cover,
                 releaseDate: i.releaseDate,
-                onDisk: !!(i.filePath && i.filePath.trim().length > 0),
+                onDisk,
                 seriesName: i.series?.name || 'Unknown Series',
                 seriesPath: i.series?.folderPath || null,
                 publisher: i.series?.publisher || 'Unknown',
-                year: i.series?.year ?? null
+                year: i.series?.year ?? null,
+                isAnnual: !!i.isAnnual,
+                isCollected: i.attachedVolume?.kind === 'COLLECTED',
+                collectionName: i.attachedVolume?.kind === 'COLLECTED' ? (i.attachedVolume?.name ?? null) : null,
+                seriesMetadataId,
+                metadataSource: i.series?.metadataSource || 'COMICVINE',
+                requestable
             };
         });
 

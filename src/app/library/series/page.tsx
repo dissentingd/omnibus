@@ -29,6 +29,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import MetadataEditorModal from "@/components/metadata-editor-modal"
 import PageManagerModal from "@/components/page-manager-modal"
 import { AttachedVolumesManager } from "@/components/attached-volumes-manager"
+import { requestNameFor } from "@/lib/utils/request-name"
 
 // Loop-safe fallback for cover <img>s: on a broken cover, swap to the series cover; if that also fails,
 // hide the element rather than show the browser's broken-image glyph. (The issue grid had no onError, so
@@ -546,25 +547,13 @@ function SeriesContent() {
             toast({ title: "Requests not enabled", description: "Ask an admin to grant you the Request permission.", variant: "destructive" });
             return;
         }
-        // Issue #200: parsedNum is NaN→null for anything parseFloat can't read (a "½" pre-fix) —
-        // fall back to the raw stored number so a request never says "#null". #203: annuals carry
-        // their domain in the composite ("Series Annual #N"), which also flips the downloader's
-        // annual-aware search guards for such a request.
-        const reqNum = (issue.parsedNum ?? issue.number ?? '').toString();
-        // #203 COLLECTED: a trade is searched for by its OWN title ("X-Men: From the Ashes Vol. 1"),
-        // never as "{Series} #1" — that composite would hunt for a single issue that isn't the book.
-        let compositeName = issue.isCollected
-            ? ((issue.name && issue.name !== seriesInfo.name) ? issue.name : (issue.collectionName || `${seriesInfo.name} Vol. ${reqNum}`))
-            : `${seriesInfo.name}${issue.isAnnual ? ' Annual' : ''} #${reqNum}`;
-        // The title-appending below is for single issues; a collection's name is already the whole
-        // search term, and appending to it would only make the query harder to match.
-        if (!issue.isCollected) {
-            if (issue.name && issue.name !== seriesInfo.name && !issue.name.includes(`#${reqNum}`)) {
-                compositeName += `: ${issue.name}`;
-            } else if (issue.name && issue.name.includes(`#${reqNum}`)) {
-                compositeName = issue.name;
-            }
-        }
+        // The composite is built by the ONE shared helper (request-name.ts): the library-wide
+        // Missing Issues view files through the same function, so both doors hand the downloader
+        // the identical search string. The #200 / #203 rules live there now, with their tests.
+        const { composite: compositeName, reqNum } = requestNameFor({
+            seriesName: seriesInfo.name, number: issue.number, parsedNum: issue.parsedNum,
+            name: issue.name, isAnnual: issue.isAnnual, isCollected: issue.isCollected, collectionName: issue.collectionName,
+        });
 
         setRequestingIds(prev => new Set(prev).add(issue.id));
         try {

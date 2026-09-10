@@ -60,3 +60,52 @@ describe('API Route: /api/library/issues search (provider-aware contains)', () =
         expect(where.OR[1].series.name).toEqual({ contains: 'bat', mode: 'insensitive' });
     });
 });
+
+// Requesting from the library-wide view (field report by robotshavehearts2): each row carries what
+// the series page has in hand, and says whether a request could resolve at all.
+describe('API Route: /api/library/issues — request fields', () => {
+    beforeEach(() => {
+        mocks.issueFindMany.mockResolvedValue([]);
+        mocks.seriesFindMany.mockResolvedValue([]);
+    });
+
+    const row = (id: string, over: any = {}) => ({
+        id, number: '12', name: null, coverUrl: null, releaseDate: '2024-06-01', filePath: null,
+        isAnnual: false, attachedVolume: null,
+        series: { name: 'Batman', publisher: 'DC Comics', year: 2016, folderPath: '/comics/Batman', metadataId: '42821', metadataSource: 'COMICVINE' },
+        ...over,
+    });
+
+    it('marks a missing issue of a matched series requestable, and carries the provider identity', async () => {
+        mocks.issueFindMany.mockResolvedValue([row('i1')]);
+        const data = await (await GET(new Request('http://localhost/api/library/issues?status=WANTED') as any)).json();
+        expect(data.issues[0]).toMatchObject({
+            id: 'i1', onDisk: false, requestable: true,
+            seriesMetadataId: '42821', metadataSource: 'COMICVINE', isAnnual: false, isCollected: false, collectionName: null,
+        });
+    });
+
+    it('never offers a request that cannot resolve: owned issues, and series with only a placeholder id', async () => {
+        mocks.issueFindMany.mockResolvedValue([
+            row('owned', { filePath: '/comics/Batman/012.cbz' }),
+            row('unmatched', { series: { name: 'Local TPB', publisher: 'Other', year: 2019, folderPath: '/comics/Local', metadataId: 'unmatched_abc', metadataSource: 'LOCAL' } }),
+            row('noid', { series: { name: 'Bare', publisher: 'Other', year: 2019, folderPath: '/comics/Bare', metadataId: null, metadataSource: 'COMICVINE' } }),
+        ]);
+        const data = await (await GET(new Request('http://localhost/api/library/issues') as any)).json();
+        expect(data.issues.map((i: any) => [i.id, i.requestable])).toEqual([['owned', false], ['unmatched', false], ['noid', false]]);
+    });
+
+    it('carries the annual and collected domains so the composite can be built correctly', async () => {
+        mocks.issueFindMany.mockResolvedValue([
+            row('ann', { isAnnual: true }),
+            row('tpb', { name: 'Volume 01', attachedVolume: { kind: 'COLLECTED', name: 'From the Ashes' } }),
+            row('annatt', { isAnnual: true, attachedVolume: { kind: 'ANNUAL', name: 'Batman Annual' } }),
+        ]);
+        const data = await (await GET(new Request('http://localhost/api/library/issues') as any)).json();
+        const by = Object.fromEntries(data.issues.map((i: any) => [i.id, i]));
+        expect(by.ann).toMatchObject({ isAnnual: true, isCollected: false });
+        expect(by.tpb).toMatchObject({ isCollected: true, collectionName: 'From the Ashes' });
+        // An annual attachment is not a collection: no collection name leaks onto it.
+        expect(by.annatt).toMatchObject({ isAnnual: true, isCollected: false, collectionName: null });
+    });
+});

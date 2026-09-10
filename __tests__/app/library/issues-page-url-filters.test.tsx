@@ -11,6 +11,8 @@ import { ok, stubFetchRouter } from '../../helpers/fetch';
 
 const toast = vi.fn();
 vi.mock('@/components/ui/use-toast', () => ({ useToast: () => ({ toast }) }));
+// The page now reads the session for the request permission; these tests are about filters only.
+vi.mock('next-auth/react', () => ({ useSession: () => ({ data: null }) }));
 
 const nav = vi.hoisted(() => ({
     params: new URLSearchParams(),
