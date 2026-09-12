@@ -29,6 +29,226 @@ pub(crate) fn unenriched_issue_predicate() -> &'static str {
     r#"("metadataId" IS NULL OR "metadataId" LIKE 'unmatched!_%' ESCAPE '!')"#
 }
 
+/// The VOLUME resource's credit fields (library-aware recommendations, Beta A). The old
+/// `person_credits,character_credits` are ISSUE-resource names the volume silently ignored;
+/// `people` and `characters` each arrive with the provider's appearance `count` (a string).
+/// Twin: src/lib/utils/volume-credits.ts CV_VOLUME_CREDIT_FIELDS.
+pub(crate) const CV_VOLUME_CREDIT_FIELDS: &str = "people,characters";
+/// Series the scheduled sweep backfills credits for per run — one cached, credits-only volume
+/// call each, so an existing library fills in over a few sweeps inside the hourly budget.
+pub(crate) const CREDITS_BACKFILL_PER_SWEEP: usize = 50;
+
+/// One volume-level credit: a person or character on the volume, weighted by the provider's
+/// appearance count. Written to SeriesCredit by [`persist_series_credits`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct VolumeCredit {
+    pub kind: &'static str, // "PERSON" | "CHARACTER"
+    pub provider_id: String,
+    pub name: String,
+    pub count: i64,
+}
+
+/// Exact twin of parseVolumeCredits (volume-credits.ts). None when the payload carries NEITHER
+/// key — an older cached payload, or a field_list that didn't ask — so the caller leaves the
+/// existing rows alone rather than wiping them. A key that is present but not an array (CV sends
+/// null for an empty list) reads as empty for that kind. An entry needs a non-negative integer id
+/// and a name; a duplicate (kind, id) keeps its first appearance; a count that isn't a positive
+/// number or an all-digit string is 0.
+pub(crate) fn parse_volume_credits(vol: &serde_json::Value) -> Option<Vec<VolumeCredit>> {
+    let obj = vol.as_object()?;
+    if !obj.contains_key("people") && !obj.contains_key("characters") {
+        return None;
+    }
+    let mut out = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for (kind, key) in [("PERSON", "people"), ("CHARACTER", "characters")] {
+        let Some(list) = obj.get(key).and_then(|v| v.as_array()) else { continue };
+        for entry in list {
+            let provider_id = match &entry["id"] {
+                serde_json::Value::Number(n) => n.as_i64().filter(|i| *i >= 0).map(|i| i.to_string()),
+                serde_json::Value::String(s) => {
+                    let t = s.trim();
+                    (!t.is_empty() && t.chars().all(|c| c.is_ascii_digit())).then(|| t.to_string())
+                }
+                _ => None,
+            };
+            let name = entry["name"].as_str().map(str::trim).filter(|s| !s.is_empty());
+            let (Some(provider_id), Some(name)) = (provider_id, name) else { continue };
+            if !seen.insert(format!("{kind}:{provider_id}")) {
+                continue;
+            }
+            let count = match &entry["count"] {
+                serde_json::Value::Number(n) => n.as_f64().filter(|f| f.is_finite() && *f > 0.0).map(|f| f.floor() as i64).unwrap_or(0),
+                serde_json::Value::String(s) => {
+                    let t = s.trim();
+                    if !t.is_empty() && t.chars().all(|c| c.is_ascii_digit()) { t.parse::<i64>().unwrap_or(0) } else { 0 }
+                }
+                _ => 0,
+            };
+            out.push(VolumeCredit { kind, provider_id, name: name.to_string(), count });
+        }
+    }
+    Some(out)
+}
+
+/// Exact twin of persistSeriesCredits (volume-credits.ts): replace the series' rows for one
+/// provider with `credits` and stamp Series.creditsSyncedAt, in ONE transaction so a reader never
+/// sees the half-written state. Provider facts in a side table — written regardless of the
+/// curation locks. Never fatal to the caller: a failure rolls back and is logged.
+pub(crate) async fn persist_series_credits(db: &Db, series_id: &str, source: &str, credits: &[VolumeCredit]) {
+    let mut tx = match db.pool.begin().await {
+        Ok(t) => t,
+        Err(e) => {
+            log::warn!("[Metadata] Credits write for {} could not open a transaction: {:?}", series_id, e);
+            return;
+        }
+    };
+    if let Err(e) = sqlx::query(r#"DELETE FROM "SeriesCredit" WHERE "seriesId" = $1 AND source = $2"#)
+        .bind(series_id)
+        .bind(source)
+        .execute(&mut *tx)
+        .await
+    {
+        log::warn!("[Metadata] Credits write for {} failed clearing old rows: {:?}", series_id, e);
+        return;
+    }
+    let insert = format!(
+        r#"INSERT INTO "SeriesCredit" (id, "seriesId", source, kind, "providerId", name, count, "updatedAt")
+           VALUES ($1, $2, $3, $4, $5, $6, $7, {now})"#,
+        now = db.now_expr()
+    );
+    for c in credits {
+        if let Err(e) = sqlx::query(&insert)
+            .bind(uuid::Uuid::new_v4().to_string())
+            .bind(series_id)
+            .bind(source)
+            .bind(c.kind)
+            .bind(&c.provider_id)
+            .bind(&c.name)
+            .bind(c.count)
+            .execute(&mut *tx)
+            .await
+        {
+            log::warn!("[Metadata] Credits write for {} failed on {} {}: {:?}", series_id, c.kind, c.provider_id, e);
+            return;
+        }
+    }
+    if let Err(e) = stamp_credits_synced_in(&mut tx, db, series_id).await {
+        log::warn!("[Metadata] Credits write for {} failed stamping the series: {:?}", series_id, e);
+        return;
+    }
+    if let Err(e) = tx.commit().await {
+        log::warn!("[Metadata] Credits write for {} failed to commit: {:?}", series_id, e);
+    }
+}
+
+/// Series.creditsSyncedAt = now, inside the caller's transaction.
+async fn stamp_credits_synced_in(tx: &mut sqlx::Transaction<'_, sqlx::Any>, db: &Db, series_id: &str) -> Result<(), sqlx::Error> {
+    sqlx::query(&format!(
+        r#"UPDATE "Series" SET "creditsSyncedAt" = {now_utc} WHERE id = $1"#,
+        now_utc = db.now_utc_ts_expr()
+    ))
+    .bind(series_id)
+    .execute(&mut **tx)
+    .await
+    .map(|_| ())
+}
+
+/// One ComicVine volume GET through the shared response cache — usage-logged, and 429-flagged,
+/// only on a real upstream call. `field_list` is part of the cache key, so asking for new fields
+/// is a fresh fetch rather than a stale hit.
+async fn fetch_cv_volume(db: &Db, client: &Client, api_key: &str, metadata_id: &str, field_list: &str) -> anyhow::Result<serde_json::Value> {
+    let vol_url = format!("https://comicvine.gamespot.com/api/volume/4050-{}/", metadata_id);
+    log::debug!("[Metadata Fetcher Debug] Requesting ComicVine Volume: {}", vol_url);
+    let vol_req = client
+        .get(&vol_url)
+        .query(&[("api_key", api_key), ("format", "json"), ("field_list", field_list)])
+        .header("User-Agent", "Omnibus/1.0")
+        .timeout(Duration::from_secs(15))
+        .build()?;
+    let vol_full_url = vol_req.url().to_string();
+    match crate::metadata_cache::get(db, "comicvine", &vol_full_url).await {
+        Some(hit) => Ok(hit),
+        None => {
+            let vol_resp = client.execute(vol_req).await?;
+            crate::api_usage::log(&db.pool, "comicvine", &vol_url).await;
+            if vol_resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                mark_flag(db, "cv_rate_limit_time").await;
+                anyhow::bail!("ComicVine rate limited (429) on volume fetch");
+            }
+            let j: serde_json::Value = vol_resp.json().await?;
+            crate::metadata_cache::put(db, "comicvine", &vol_full_url, &j).await;
+            Ok(j)
+        }
+    }
+}
+
+/// The series a credits backfill pass considers, oldest-touched first: ComicVine-sourced, with a
+/// real (paired, not `unmatched_*`) volume id, never stamped with creditsSyncedAt. `cap` bounds one
+/// pass. Columns: id, name, "metadataId".
+pub(crate) fn credits_backfill_candidates_sql(cap: usize) -> String {
+    format!(
+        r#"SELECT id, name, "metadataId" FROM "Series"
+           WHERE "metadataSource" = 'COMICVINE' AND "metadataId" IS NOT NULL
+             AND "metadataId" NOT LIKE 'unmatched!_%' ESCAPE '!'
+             AND "creditsSyncedAt" IS NULL
+           ORDER BY "updatedAt" ASC LIMIT {cap}"#
+    )
+}
+
+/// Library-aware recommendations (Beta A): series never asked for their volume credits
+/// (creditsSyncedAt IS NULL — every series from before the field-name fix) get one credits-only
+/// volume call per scheduled sweep, `cap` at a time, so an existing library fills in over a few
+/// sweeps with no new job or button. File-complete series never re-sync, so nothing else would
+/// ever ask for them. A rate limit ends the pass; the next sweep resumes. A payload with no
+/// credit fields at all (a volume ComicVine no longer has) is stamped so it can't starve the
+/// queue — a manual refresh still re-asks. Targeted syncs write credits through fetch_comicvine.
+async fn backfill_series_credits(db: &Db, client: &Client, api_key: &str, cap: usize) {
+    let rows = match sqlx::query(&credits_backfill_candidates_sql(cap)).fetch_all(&db.pool).await {
+        Ok(r) => r,
+        Err(e) => {
+            log::warn!("[Metadata] Credits backfill could not list series: {:?}", e);
+            return;
+        }
+    };
+    if rows.is_empty() {
+        return;
+    }
+    log::info!("[Metadata] Backfilling volume credits for {} series (scheduled sweep).", rows.len());
+    let mut written = 0usize;
+    for row in &rows {
+        let series_id: String = row.get("id");
+        let name: String = row.get("name");
+        let metadata_id: String = row.get("metadataId");
+        match fetch_cv_volume(db, client, api_key, &metadata_id, CV_VOLUME_CREDIT_FIELDS).await {
+            Ok(j) => match parse_volume_credits(&j["results"]) {
+                Some(credits) => {
+                    persist_series_credits(db, &series_id, "COMICVINE", &credits).await;
+                    written += 1;
+                }
+                None => {
+                    log::warn!("[Metadata] Volume {} for {} answered without credit fields — stamped, not retried by the sweep.", metadata_id, name);
+                    if let Ok(mut tx) = db.pool.begin().await {
+                        if stamp_credits_synced_in(&mut tx, db, &series_id).await.is_ok() {
+                            let _ = tx.commit().await;
+                        }
+                    }
+                }
+            },
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("429") {
+                    log::warn!("[Metadata] Credits backfill halted by a ComicVine rate limit after {} series; the next sweep resumes.", written);
+                    return;
+                }
+                log::warn!("[Metadata] Credits backfill failed for {}: {}", name, msg);
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    log::info!("[Metadata] Credits backfill wrote {} of {} series this sweep.", written, rows.len());
+}
+
 /// How many times a rate-limit-halted batch re-queues itself before giving up. The scheduled
 /// sweep is the durable backstop either way — with the Ended-complete skip gated on enrichment,
 /// nothing is stranded by giving up here.
@@ -276,6 +496,15 @@ async fn sync_metadata_attempt(db: Db, series_ids: Option<Vec<String>>, rate_lim
         }
     }
 
+    // Library-aware recommendations (Beta A): the scheduled sweep also backfills volume credits for
+    // series that predate the field-name fix — file-complete series never re-sync, so nothing else
+    // would ever ask for theirs. Skipped when this batch already hit a rate limit.
+    if !full_fetch && halted_at.is_none() {
+        if let Some(key) = cv_api_key.as_deref().filter(|k| !k.is_empty()) {
+            backfill_series_credits(&db, &client, key, CREDITS_BACKFILL_PER_SWEEP).await;
+        }
+    }
+
     // 2026-07-26 (worklist item 10 follow-up): a halted batch used to evaporate — the BullMQ job
     // completes as soon as the engine ACCEPTs, so nothing upstream ever retries. Re-queue the
     // unfinished tail here (delayed, attempt-capped). A retried batch runs as TARGETED
@@ -342,37 +571,11 @@ async fn fetch_comicvine(
     file_priority: bool,
 ) -> anyhow::Result<i32> {
     // ---- 1. Volume details ----
-    let vol_url = format!("https://comicvine.gamespot.com/api/volume/4050-{}/", metadata_id);
-    log::debug!("[Metadata Fetcher Debug] Requesting ComicVine Volume: {}", vol_url);
-
-    let vol_req = client
-        .get(&vol_url)
-        .query(&[
-            ("api_key", api_key),
-            ("format", "json"),
-            ("field_list", "image,description,deck,publisher,start_year,name,person_credits,character_credits,concepts,end_year,count_of_issues"),
-        ])
-        .header("User-Agent", "Omnibus/1.0")
-        .timeout(Duration::from_secs(15))
-        .build()?;
-    let vol_full_url = vol_req.url().to_string();
-
-    // Shared response cache (metadata_cache_enabled): a hit is not an upstream call, so usage
-    // logging and 429 handling only run on the real-fetch path.
-    let vol_json: serde_json::Value = match crate::metadata_cache::get(db, "comicvine", &vol_full_url).await {
-        Some(hit) => hit,
-        None => {
-            let vol_resp = client.execute(vol_req).await?;
-            crate::api_usage::log(&db.pool, "comicvine", &vol_url).await;
-            if vol_resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                mark_flag(db, "cv_rate_limit_time").await;
-                anyhow::bail!("ComicVine rate limited (429) on volume fetch");
-            }
-            let j: serde_json::Value = vol_resp.json().await?;
-            crate::metadata_cache::put(db, "comicvine", &vol_full_url, &j).await;
-            j
-        }
-    };
+    // Shared response cache (metadata_cache_enabled) inside fetch_cv_volume: a hit is not an
+    // upstream call, so usage logging and 429 handling only run on the real-fetch path.
+    // `people,characters` are the volume resource's credit fields (parity with metadata-fetcher.ts).
+    let field_list = format!("image,description,deck,publisher,start_year,name,{CV_VOLUME_CREDIT_FIELDS},concepts,end_year,count_of_issues");
+    let vol_json = fetch_cv_volume(db, client, api_key, metadata_id, &field_list).await?;
     let vol_data = &vol_json["results"];
     if vol_data.is_null() {
         anyhow::bail!("Volume data not found on ComicVine for {}", metadata_id);
@@ -467,6 +670,15 @@ async fn fetch_comicvine(
     };
     if let Err(e) = update_res {
         log::error!("[Metadata] Failed to update series {}: {:?}", series_name, e);
+    }
+
+    // Library-aware recommendations (Beta A): the volume's people/characters go to SeriesCredit —
+    // provider facts, written regardless of the locks above, and only REPLACED when the payload
+    // carried the arrays (an older cached payload leaves the rows alone). Before the issue
+    // pagination, so the Ended-complete early return below still leaves them written.
+    // Parity with metadata-fetcher.ts.
+    if let Some(credits) = parse_volume_credits(vol_data) {
+        persist_series_credits(db, series_id, "COMICVINE", &credits).await;
     }
 
     tokio::time::sleep(Duration::from_secs(3)).await;
@@ -2008,6 +2220,117 @@ mod tests {
         // …and dropping the claim frees the series for the next legitimate sync.
         drop(claim);
         assert!(SyncClaim::try_acquire("claim-test-194").is_some());
+    }
+
+    // ==== Library-aware recommendations (Beta A): volume-level credits. The parser rules are the
+    // EXACT twin of __tests__/lib/utils/volume-credits.test.ts — keep the two in step. ====
+
+    #[test]
+    fn parse_volume_credits_reads_people_and_characters_with_string_counts() {
+        let vol = serde_json::json!({
+            "name": "X-Men",
+            "people": [{"id": 41609, "name": "Tom Brevoort", "count": "36"}, {"id": 1, "name": "Jed MacKay", "count": 36}],
+            "characters": [{"id": 1462, "name": "Beast", "count": "32"}]
+        });
+        let rows = parse_volume_credits(&vol).expect("both keys present");
+        assert_eq!(rows, vec![
+            VolumeCredit { kind: "PERSON", provider_id: "41609".into(), name: "Tom Brevoort".into(), count: 36 },
+            VolumeCredit { kind: "PERSON", provider_id: "1".into(), name: "Jed MacKay".into(), count: 36 },
+            VolumeCredit { kind: "CHARACTER", provider_id: "1462".into(), name: "Beast".into(), count: 32 },
+        ]);
+    }
+
+    #[test]
+    fn parse_volume_credits_is_none_without_either_key_and_empty_for_null_lists() {
+        // Neither key: an older cached payload — the caller must leave existing rows alone.
+        assert!(parse_volume_credits(&serde_json::json!({"name": "Batman", "concepts": []})).is_none());
+        assert!(parse_volume_credits(&serde_json::Value::Null).is_none());
+        assert!(parse_volume_credits(&serde_json::json!([])).is_none());
+        // Present-but-null is empty for that kind (ComicVine sends null for an empty list).
+        let rows = parse_volume_credits(&serde_json::json!({"people": null, "characters": [{"id": 7, "name": "Robin", "count": "2"}]})).unwrap();
+        assert_eq!(rows, vec![VolumeCredit { kind: "CHARACTER", provider_id: "7".into(), name: "Robin".into(), count: 2 }]);
+        assert_eq!(parse_volume_credits(&serde_json::json!({"people": null, "characters": null})).unwrap(), Vec::<VolumeCredit>::new());
+    }
+
+    #[test]
+    fn parse_volume_credits_skips_bad_entries_and_keeps_the_first_duplicate() {
+        let vol = serde_json::json!({
+            "people": [
+                {"id": "abc", "name": "No Id"},
+                {"id": 5, "name": "   "},
+                {"id": 5, "name": "Twice", "count": "lots"},
+                {"id": "5", "name": "Twice Again", "count": 9},
+                {"id": 6, "name": "Negative", "count": -3}
+            ]
+        });
+        let rows = parse_volume_credits(&vol).unwrap();
+        assert_eq!(rows, vec![
+            VolumeCredit { kind: "PERSON", provider_id: "5".into(), name: "Twice".into(), count: 0 },
+            VolumeCredit { kind: "PERSON", provider_id: "6".into(), name: "Negative".into(), count: 0 },
+        ]);
+    }
+
+    #[tokio::test]
+    async fn persist_series_credits_replaces_the_set_and_stamps_the_series() {
+        static INIT: std::sync::Once = std::sync::Once::new();
+        INIT.call_once(sqlx::any::install_default_drivers);
+        let pool = sqlx::any::AnyPoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:").await.unwrap();
+        let db = Db { pool, dialect: crate::db::Dialect::Sqlite };
+        sqlx::query(r#"CREATE TABLE "Series" (id TEXT PRIMARY KEY, "creditsSyncedAt" INTEGER)"#).execute(&db.pool).await.unwrap();
+        sqlx::query(
+            r#"CREATE TABLE "SeriesCredit" (id TEXT PRIMARY KEY, "seriesId" TEXT, source TEXT, kind TEXT, "providerId" TEXT, name TEXT, count INTEGER, "updatedAt" INTEGER)"#,
+        ).execute(&db.pool).await.unwrap();
+        sqlx::query(r#"INSERT INTO "Series" (id) VALUES ('s1')"#).execute(&db.pool).await.unwrap();
+        // A row from another provider must survive a ComicVine rewrite.
+        sqlx::query(r#"INSERT INTO "SeriesCredit" (id, "seriesId", source, kind, "providerId", name, count, "updatedAt") VALUES ('m1', 's1', 'METRON', 'PERSON', '9', 'Someone', 1, 0)"#)
+            .execute(&db.pool).await.unwrap();
+
+        persist_series_credits(&db, "s1", "COMICVINE", &[
+            VolumeCredit { kind: "PERSON", provider_id: "41609".into(), name: "Tom Brevoort".into(), count: 36 },
+            VolumeCredit { kind: "CHARACTER", provider_id: "1462".into(), name: "Beast".into(), count: 32 },
+        ]).await;
+        let first: Vec<(String, String, i64)> = sqlx::query_as(r#"SELECT kind, name, count FROM "SeriesCredit" WHERE "seriesId"='s1' AND source='COMICVINE' ORDER BY kind"#)
+            .fetch_all(&db.pool).await.unwrap();
+        assert_eq!(first, vec![("CHARACTER".into(), "Beast".into(), 32), ("PERSON".into(), "Tom Brevoort".into(), 36)]);
+        let stamped: Option<i64> = sqlx::query_scalar(r#"SELECT "creditsSyncedAt" FROM "Series" WHERE id='s1'"#).fetch_one(&db.pool).await.unwrap();
+        assert!(stamped.is_some_and(|ms| ms > 0), "creditsSyncedAt must be stamped: {stamped:?}");
+
+        // A second sync REPLACES the set (Beast is gone, a new person appears) — no accumulation.
+        persist_series_credits(&db, "s1", "COMICVINE", &[
+            VolumeCredit { kind: "PERSON", provider_id: "1".into(), name: "Jed MacKay".into(), count: 12 },
+        ]).await;
+        let second: Vec<(String, String)> = sqlx::query_as(r#"SELECT source, name FROM "SeriesCredit" WHERE "seriesId"='s1' ORDER BY source"#)
+            .fetch_all(&db.pool).await.unwrap();
+        assert_eq!(second, vec![("COMICVINE".into(), "Jed MacKay".into()), ("METRON".into(), "Someone".into())]);
+    }
+
+    #[tokio::test]
+    async fn credits_backfill_picks_unstamped_comicvine_series_oldest_first_within_the_cap() {
+        static INIT: std::sync::Once = std::sync::Once::new();
+        INIT.call_once(sqlx::any::install_default_drivers);
+        let pool = sqlx::any::AnyPoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:").await.unwrap();
+        sqlx::query(r#"CREATE TABLE "Series" (id TEXT PRIMARY KEY, name TEXT, "metadataId" TEXT, "metadataSource" TEXT, "creditsSyncedAt" INTEGER, "updatedAt" INTEGER)"#)
+            .execute(&pool).await.unwrap();
+        for (id, mid, src, stamped, updated) in [
+            ("old", Some("100"), "COMICVINE", None::<i64>, 10),      // never asked, oldest → first
+            ("new", Some("101"), "COMICVINE", None, 30),             // never asked → second
+            ("done", Some("102"), "COMICVINE", Some(5), 5),          // already stamped → out
+            ("metron", Some("7"), "METRON", None, 1),                // other provider → out
+            ("scan", Some("unmatched_abc"), "COMICVINE", None, 2),   // scanner placeholder → out
+            ("none", None, "COMICVINE", None, 3),                    // no id at all → out
+            ("third", Some("103"), "COMICVINE", None, 40),           // beyond the cap of 2
+        ] {
+            sqlx::query(r#"INSERT INTO "Series" (id, name, "metadataId", "metadataSource", "creditsSyncedAt", "updatedAt") VALUES ($1, $1, $2, $3, $4, $5)"#)
+                .bind(id).bind(mid).bind(src).bind(stamped).bind(updated).execute(&pool).await.unwrap();
+        }
+        let picked: Vec<String> = sqlx::query_scalar(&credits_backfill_candidates_sql(2)).fetch_all(&pool).await.unwrap();
+        assert_eq!(picked, vec!["old".to_string(), "new".to_string()]);
+        let all: Vec<String> = sqlx::query_scalar(&credits_backfill_candidates_sql(50)).fetch_all(&pool).await.unwrap();
+        assert_eq!(all, vec!["old".to_string(), "new".to_string(), "third".to_string()]);
     }
 
     // ==== Discussion #182: the scheduled sync must skip series whose FILES already supplied

@@ -198,11 +198,13 @@ model Series {
   hasCustomMetadata Boolean @default(false) // Series was manually curated in the metadata editor; auto-sync must not overwrite its narrative fields
   hasCustomCover  Boolean @default(false) // Admin uploaded a custom cover.jpg; extraction + provider-sync must never overwrite it
   lastMetadataSync DateTime? // Last successful provider sync (UTC); keys incremental fetches (Metron modified_gt)
+  creditsSyncedAt DateTime? // Last time the volume's people/characters were written to SeriesCredit (null = never asked with those fields; the scheduled sweep backfills)
   createdAt       DateTime @default(now())
   updatedAt       DateTime @default(now()) @updatedAt
 
   issues          Issue[]
   attachedVolumes AttachedVolume[]
+  credits         SeriesCredit[]
   favorites       Favorite[]
   follows         SeriesFollow[]
   collectionItems CollectionItem[]
@@ -324,6 +326,29 @@ model AttachedVolume {
   issues         Issue[]
 
   @@unique([seriesId, metadataSource, volumeId])
+  @@index([seriesId])
+}
+
+// Library-aware recommendations (field report by robotshavehearts2): the provider's own
+// volume-level credits — every person and character on the volume, with the provider's appearance
+// count as the weight. Provider FACTS in a side table: never curated, never embedded, written on
+// every volume sync regardless of hasCustomMetadata/file-priority locks. The Series.characters /
+// writers JSON columns are ComicInfo fallbacks and stay untouched. One row per (series, source,
+// kind, provider id); the [kind, providerId] index serves the library-wide "which series share
+// this person/character" aggregation the recommender runs.
+model SeriesCredit {
+  id         String   @id @default(cuid())
+  seriesId   String
+  series     Series   @relation(fields: [seriesId], references: [id], onDelete: Cascade)
+  source     String   @default("COMICVINE") // provider the id belongs to
+  kind       String   // "PERSON" | "CHARACTER"
+  providerId String   // ComicVine person (4040-) / character (4005-) id, without the prefix
+  name       String
+  count      Int      @default(0) // provider's appearance count within this volume
+  updatedAt  DateTime @default(now()) @updatedAt
+
+  @@unique([seriesId, source, kind, providerId])
+  @@index([kind, providerId])
   @@index([seriesId])
 }
 

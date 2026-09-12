@@ -13,6 +13,7 @@ import { cachedCvGet } from './metadata/metadata-cache';
 import { isSameIssue } from '@/lib/utils/issue-parser';
 import { resolveSyncedName, detailNameWrite } from '@/lib/utils/synced-name';
 import { findLocalCoverBasename, providerCoverBlocked } from '@/lib/utils/cover-plan';
+import { CV_VOLUME_CREDIT_FIELDS, parseVolumeCredits, persistSeriesCredits } from '@/lib/utils/volume-credits';
 
 // Providers rarely report when a series ends, so Omnibus guesses: no new issue
 // within the admin-configured window (months) = Ended. Returns null when the
@@ -325,7 +326,9 @@ export async function syncSeriesMetadata(metadataId: string, folderPath: string,
         // Cache-aware (metadata_cache_enabled): usage logging happens inside cachedCvGet for real
         // upstream calls only.
         volRes = await cachedCvGet(`https://comicvine.gamespot.com/api/volume/4050-${metadataId}/`, {
-            params: { api_key: setting.value, format: 'json', field_list: 'image,description,deck,publisher,start_year,name,person_credits,character_credits,concepts,end_year,count_of_issues' },
+            // `people,characters` are the VOLUME resource's credit fields (the old
+            // person_credits/character_credits are issue-resource names the volume ignored).
+            params: { api_key: setting.value, format: 'json', field_list: `image,description,deck,publisher,start_year,name,${CV_VOLUME_CREDIT_FIELDS},concepts,end_year,count_of_issues` },
             headers: { 'User-Agent': 'Omnibus/1.0' },
             timeout: 15000
         });
@@ -406,6 +409,20 @@ export async function syncSeriesMetadata(metadataId: string, folderPath: string,
             status: volData.end_year ? 'Ended' : 'Ongoing'
         }
     });
+
+    // Library-aware recommendations (Beta A): the volume's people/characters, with appearance
+    // counts, go to SeriesCredit — provider facts in a side table, written regardless of the
+    // curation locks above, and only REPLACED when the payload actually carried the arrays (an
+    // older cached payload without them leaves the rows alone). Never fatal to the sync. Runs
+    // before the issue pagination so an early return below still leaves the credits written.
+    const volCredits = parseVolumeCredits(volData);
+    if (volCredits) {
+        try {
+            await persistSeriesCredits(series.id, 'COMICVINE', volCredits);
+        } catch (e: unknown) {
+            Logger.log(`[Metadata] Credits write failed for ${series.name}: ${getErrorMessage(e)}`, 'warn');
+        }
+    }
 
     await new Promise(r => setTimeout(r, 3000));
 

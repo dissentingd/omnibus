@@ -14,7 +14,11 @@ const mocks = vi.hoisted(() => ({
     axiosGet: vi.fn(),
     queueAdd: vi.fn(),
     existsSync: vi.fn(),
-    writeFile: vi.fn()
+    writeFile: vi.fn(),
+    // Volume-level credits (library-aware recommendations, Beta A) land through one transaction.
+    transaction: vi.fn(),
+    creditDeleteMany: vi.fn(),
+    creditCreateMany: vi.fn()
 }));
 
 // 2. Mock Dependencies
@@ -23,7 +27,9 @@ vi.mock('@/lib/db', () => ({
         series: { findFirst: mocks.seriesFindFirst, update: mocks.seriesUpdate },
         // <-- ADDED: findMany wired to our mock
         issue: { findFirst: mocks.issueFindFirst, findMany: mocks.issueFindMany, create: mocks.issueCreate, update: mocks.issueUpdate },
-        systemSetting: { findUnique: mocks.systemSettingFindUnique }
+        systemSetting: { findUnique: mocks.systemSettingFindUnique },
+        seriesCredit: { deleteMany: mocks.creditDeleteMany, createMany: mocks.creditCreateMany },
+        $transaction: mocks.transaction
     }
 }));
 
@@ -302,5 +308,52 @@ describe('Metadata Pipeline: ComicVine Sync Engine', () => {
         // The cross-series adoption probe carries the same exclusion.
         const adoption = mocks.issueFindFirst.mock.calls.map(c => c[0]).find(a => a?.where?.metadataId === '300001');
         expect(adoption?.where?.isAnnual).toBe(false);
+    });
+
+    // Library-aware recommendations (Beta A): the volume call asks for the VOLUME resource's credit
+    // fields and lands them in SeriesCredit on every sync — the same rows the engine twin writes.
+    it("asks the volume for people/characters and writes them to SeriesCredit in one transaction", async () => {
+        mocks.axiosGet.mockImplementation(async (url: string) => {
+            if (url.includes('/volume/')) {
+                return { data: { results: {
+                    name: 'X-Men', start_year: '2024', publisher: { name: 'Marvel' }, image: null,
+                    people: [{ id: 41609, name: 'Tom Brevoort', count: '36' }],
+                    characters: [{ id: 1462, name: 'Beast', count: '32' }, { id: 1459, name: 'Cyclops', count: '31' }],
+                } } };
+            }
+            return { data: { number_of_total_results: 0, results: [] } };
+        });
+        mocks.existsSync.mockReturnValue(false);
+
+        const result = await syncSeriesMetadata('123', '/comics/X-Men', 'COMICVINE');
+        expect(result.success).toBe(true);
+
+        const volumeCall = mocks.axiosGet.mock.calls.find(c => String(c[0]).includes('/volume/'));
+        const fieldList: string = volumeCall?.[1]?.params?.field_list || '';
+        expect(fieldList).toContain('people,characters');
+        expect(fieldList).not.toContain('person_credits'); // the issue-resource names the volume ignored
+
+        expect(mocks.transaction).toHaveBeenCalledTimes(1);
+        expect(mocks.creditDeleteMany).toHaveBeenCalledWith({ where: { seriesId: 'series_1', source: 'COMICVINE' } });
+        expect(mocks.creditCreateMany).toHaveBeenCalledWith({ data: [
+            { seriesId: 'series_1', source: 'COMICVINE', kind: 'PERSON', providerId: '41609', name: 'Tom Brevoort', count: 36 },
+            { seriesId: 'series_1', source: 'COMICVINE', kind: 'CHARACTER', providerId: '1462', name: 'Beast', count: 32 },
+            { seriesId: 'series_1', source: 'COMICVINE', kind: 'CHARACTER', providerId: '1459', name: 'Cyclops', count: 31 },
+        ] });
+        expect(mocks.seriesUpdate).toHaveBeenCalledWith({ where: { id: 'series_1' }, data: { creditsSyncedAt: expect.any(Date) } });
+    });
+
+    it('leaves SeriesCredit alone when the volume payload carries no credit fields (older cached shape)', async () => {
+        mocks.axiosGet.mockImplementation(async (url: string) => {
+            if (url.includes('/volume/')) {
+                return { data: { results: { name: 'Batman', start_year: '2016', publisher: { name: 'DC Comics' }, image: null } } };
+            }
+            return { data: { number_of_total_results: 0, results: [] } };
+        });
+        mocks.existsSync.mockReturnValue(false);
+
+        await syncSeriesMetadata('123', '/comics/Batman', 'COMICVINE');
+        expect(mocks.transaction).not.toHaveBeenCalled();
+        expect(mocks.creditDeleteMany).not.toHaveBeenCalled();
     });
 });
