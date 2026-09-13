@@ -1,7 +1,12 @@
 "use client"
 
-import { SessionProvider, useSession } from "next-auth/react"
+import { SessionProvider, useSession, signOut } from "next-auth/react"
+import { usePathname } from "next/navigation"
 import { useEffect, useRef } from "react"
+import { useToast } from "@/components/ui/use-toast"
+import {
+  SESSION_EXPIRED_TOAST, claimExpiryOnce, isGuardedApiUrl, isPublicPath, loginUrlFor, nav, sessionLooksExpired,
+} from "@/lib/session-expiry-client"
 
 // The jwt callback no longer counts ambient session reads (the 300s refetch below, background
 // polls) as activity, so this tracker is the only thing that slides the inactivity window:
@@ -32,6 +37,50 @@ export function SessionActivityTracker() {
   return null;
 }
 
+/**
+ * #204: the session ending — by the inactivity flag OR by the cookie simply lapsing — sends the
+ * user to /login with a return path instead of leaving a dead page up. Two observers, one action:
+ *   - the session itself: the flag, or an EMPTY session after a user was present here;
+ *   - a 401 from our own /api while a user was present (the race where the click lands before the
+ *     refetch does — the black "Unauthorized Access" dialog of the report).
+ * Public pages never bounce; it fires once per page life.
+ */
+export function SessionExpiryGuard() {
+  const { data: session, status } = useSession();
+  const pathname = usePathname();
+  const { toast } = useToast();
+  const hadUserRef = useRef(false);
+  if (session?.user) hadUserRef.current = true;
+
+  const fire = () => {
+    if (isPublicPath(pathname ?? window.location.pathname) || !claimExpiryOnce()) return;
+    toast({ ...SESSION_EXPIRED_TOAST, variant: "destructive" });
+    const back = window.location.pathname + window.location.search;
+    Promise.resolve(signOut({ redirect: false })).catch(() => {}).then(() => nav.go(loginUrlFor(back)));
+  };
+  const fireRef = useRef(fire);
+  fireRef.current = fire;
+
+  useEffect(() => {
+    if (sessionLooksExpired(status, (session as any)?.error, hadUserRef.current)) fireRef.current();
+  }, [status, session]);
+
+  // The 401 net. Wraps window.fetch for this page's life; the caller still receives its response.
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const original = window.fetch;
+    const wrapped: typeof window.fetch = async (input, init) => {
+      const res = await original(input, init);
+      if (res.status === 401 && hadUserRef.current && isGuardedApiUrl(input)) fireRef.current();
+      return res;
+    };
+    window.fetch = wrapped;
+    return () => { if (window.fetch === wrapped) window.fetch = original; };
+  }, []);
+
+  return null;
+}
+
 export function AuthProvider({ children }: { children: React.ReactNode }) {
   return (
     <SessionProvider
@@ -42,6 +91,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       refetchOnWindowFocus={true}
     >
       <SessionActivityTracker />
+      <SessionExpiryGuard />
       {children}
     </SessionProvider>
   )

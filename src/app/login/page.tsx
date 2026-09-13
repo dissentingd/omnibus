@@ -16,6 +16,14 @@ import { OmnibusLogo } from "@/components/omnibus-logo"
 import packageJson from "../../../package.json"
 import { Logger } from "@/lib/logger"
 import { getErrorMessage } from "@/lib/utils/error"
+import { isSafeReturnPath } from "@/lib/session-expiry-client"
+
+/** Where to land after signing in: the guarded return path the expiry bounce carried, else home (#204). */
+function returnPathFromLocation(): string {
+  if (typeof window === 'undefined') return '/';
+  const back = new URLSearchParams(window.location.search).get('callbackUrl');
+  return isSafeReturnPath(back) ? back : '/';
+}
 
 export default function LoginPage() {
   const router = useRouter()
@@ -121,7 +129,7 @@ export default function LoginPage() {
         setErrorMsg(message);
       } else {
         router.refresh();
-        router.push("/");
+        router.push(returnPathFromLocation());
       }
     } catch (error) {
       setErrorMsg("Connection to database failed.")
@@ -191,7 +199,7 @@ export default function LoginPage() {
 
   const handleSsoLogin = () => {
       setSsoLoading(true);
-      signIn('oidc');
+      signIn('oidc', { callbackUrl: returnPathFromLocation() });
   }
 
   return (

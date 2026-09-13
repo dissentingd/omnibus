@@ -218,18 +218,8 @@ export function SiteHeader() {
   const [passwords, setPasswords] = useState({ current: "", new: "", confirm: "" })
   const [passLoading, setPassLoading] = useState(false)
 
-  useEffect(() => {
-    if ((session as any)?.error === "SessionExpired") {
-      toast({ 
-        title: "Session Expired", 
-        description: "You have been logged out due to inactivity.", 
-        variant: "destructive" 
-      });
-      signOut({ redirect: false }).then(() => {
-        window.location.href = '/login';
-      });
-    }
-  }, [session, toast]);
+  // Session expiry (the inactivity flag AND a lapsed cookie) is handled once, for every page, by
+  // SessionExpiryGuard in AuthProvider (#204) — it also carries the user back after signing in.
 
   const handleChangePassword = async (e: React.FormEvent) => {
       e.preventDefault();
