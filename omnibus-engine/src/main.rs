@@ -18,6 +18,7 @@ mod matcher;
 mod metadata_cache;
 mod engine_config;
 mod discover;
+mod recommendations;
 mod monitor;
 mod download;
 mod log_forward;
@@ -508,6 +509,7 @@ async fn run(db_url: String, db_connections: u32) -> anyhow::Result<()> {
         .route("/api/metadata/export-series-json", post(handle_export_series_json))
         .route("/api/metadata/attach-sync", post(handle_attach_sync))
         .route("/api/discover/sync", post(handle_discover_sync))
+        .route("/api/discover/for-you", post(handle_for_you_sync))
         .route("/api/monitor/sync", post(handle_monitor_sync))
         .route("/api/download/stream", post(handle_download_stream))
         .route("/api/automation/search", post(handle_search))
@@ -1713,6 +1715,32 @@ async fn handle_discover_sync(State(state): State<Arc<AppState>>) -> StatusCode 
             Err(e) => {
                 log::error!("❌ Background Discover Sync failed: {:?}", e);
                 write_failed_joblog(&db, "DISCOVER_SYNC", start_time.elapsed().as_millis() as i32, format!("Discover sync failed: {:?}", e)).await;
+            },
+        }
+    });
+
+    StatusCode::ACCEPTED
+}
+
+/// FOR_YOU_SYNC (library-aware recommendations, Beta B): rebuilds the `discover_cache_for_you`
+/// cache from the SeriesCredit ledger. Accept-then-background like the Discover sync; the JobLog
+/// carries the outcome.
+async fn handle_for_you_sync(State(state): State<Arc<AppState>>) -> StatusCode {
+    log::info!("Received request to run the For-You recommendations sync.");
+
+    tokio::spawn(async move {
+        let db = state.db.clone();
+        let start_time = std::time::Instant::now();
+
+        match recommendations::run_for_you_sync(state.db.clone()).await {
+            Ok((_count, details)) => {
+                let duration = start_time.elapsed().as_millis() as i32;
+                log::info!("[For You] {}", details);
+                write_joblog(&db, "FOR_YOU_SYNC", "COMPLETED", duration, details).await;
+            },
+            Err(e) => {
+                log::error!("❌ Background For-You sync failed: {:?}", e);
+                write_failed_joblog(&db, "FOR_YOU_SYNC", start_time.elapsed().as_millis() as i32, format!("For-You sync failed: {:?}", e)).await;
             },
         }
     });

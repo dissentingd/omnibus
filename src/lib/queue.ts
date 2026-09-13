@@ -144,7 +144,10 @@ export async function syncSchedules() {
     // --------------------------------
     
     await addJob('DISCOVER_SYNC', config.popular_sync_schedule);
-    
+    // Library-aware recommendations (Beta B) rebuild on the Discover cadence — same setting, no
+    // new schedule plumbing; the engine owns the build like the Discover feed.
+    await addJob('FOR_YOU_SYNC', config.popular_sync_schedule);
+
     // --- ADDED: Digest Cron Logic ---
     let digestCron;
     // Only use CRON if they selected "Weekly" (168 hours)
@@ -1112,8 +1115,30 @@ export function initWorker() {
                     break;
                 }
 
+                case 'FOR_YOU_SYNC': {
+                    // Library-aware recommendations (Beta B): the engine ranks the SeriesCredit
+                    // ledger against ComicVine (/api/discover/for-you -> recommendations::run_for_you_sync)
+                    // and writes the discover_cache_for_you cache + the COMPLETED/FAILED JobLog.
+                    await prisma.systemSetting.upsert({
+                        where: { key: 'last_for_you_sync' },
+                        update: { value: nowStr },
+                        create: { key: 'last_for_you_sync', value: nowStr }
+                    });
+
+                    Logger.log(`[BullMQ] Forwarding For-You recommendations sync to Rust Engine...`, 'info');
+                    try {
+                        const rustResponse = await fetch(ENGINE_URL + '/api/discover/for-you', { method: 'POST', headers: engineHeaders() });
+                        if (!rustResponse.ok) throw new Error(`Rust returned status ${rustResponse.status}`);
+                        Logger.log(`[BullMQ] Rust Engine successfully took over the For-You sync!`, 'info');
+                    } catch (e) {
+                        Logger.log(`[BullMQ] Failed to offload For-You sync to Rust: ${getErrorMessage(e)}`, 'error');
+                        throw e;
+                    }
+                    break;
+                }
+
                 case 'WEEKLY_DIGEST': {
-                    await prisma.systemSetting.upsert({ 
+                    await prisma.systemSetting.upsert({
                         where: { key: 'last_weekly_digest' }, 
                         update: { value: nowStr }, 
                         create: { key: 'last_weekly_digest', value: nowStr } 

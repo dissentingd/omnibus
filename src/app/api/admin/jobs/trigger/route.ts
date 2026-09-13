@@ -27,6 +27,7 @@ export async function POST(request: Request) {
             'monitor': 'SERIES_MONITOR',
             'diagnostics': 'DIAGNOSTICS',
             'popular': 'DISCOVER_SYNC',
+            'for_you': 'FOR_YOU_SYNC',
             'storage_scan': 'STORAGE_SCAN',
             'health_check': 'SYSTEM_HEALTH_CHECK',
             'update_check': 'UPDATE_CHECK',

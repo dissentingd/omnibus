@@ -89,12 +89,12 @@ pub(crate) fn contains_word(haystack: &str, needle: &str) -> bool {
     false
 }
 
-struct DiscoverConfig {
-    cv_api_key: String,
-    filter_enabled: bool,
+pub(crate) struct DiscoverConfig {
+    pub(crate) cv_api_key: String,
+    pub(crate) filter_enabled: bool,
     blocked_publishers: Vec<String>,
     blocked_keywords: Vec<String>,
-    manga_filter_mode: String,
+    pub(crate) manga_filter_mode: String,
     allowed_manga_pubs: Vec<String>,
     manga_publishers: Vec<String>,
 }
@@ -125,7 +125,10 @@ impl DiscoverConfig {
     }
 
     /// Publisher/keyword blocklist + manga-mode filtering (parity with queue.ts `isValid`).
-    fn is_valid(&self, item: &Value) -> bool {
+    /// `item` is issue-shaped: `volume.{publisher,name,concepts}` + top-level `deck`/`description`.
+    /// The For-You builder (recommendations.rs) wraps a bare volume the same way so both feeds
+    /// apply ONE filter.
+    pub(crate) fn is_valid(&self, item: &Value) -> bool {
         let pub_name = item.pointer("/volume/publisher/name").and_then(|v| v.as_str()).unwrap_or("").trim().to_lowercase();
         let vol_name = item.pointer("/volume/name").and_then(|v| v.as_str()).unwrap_or("").trim().to_lowercase();
         let empty: Vec<Value> = Vec::new();
@@ -324,7 +327,7 @@ impl DiscoverConfig {
     }
 }
 
-async fn upsert_setting(db: &Db, key: &str, value: &str) -> Result<()> {
+pub(crate) async fn upsert_setting(db: &Db, key: &str, value: &str) -> Result<()> {
     sqlx::query(r#"INSERT INTO "SystemSetting" (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value"#)
         .bind(key)
         .bind(value)
@@ -333,7 +336,10 @@ async fn upsert_setting(db: &Db, key: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
-pub async fn run_discover_sync(db: Db) -> Result<(i32, String)> {
+/// The Discover filter config + the raw settings map, from the database. Shared by the Discover
+/// feed and the For-You (library-aware recommendations) builder so both apply the same
+/// blocklists and manga mode. Fails when no ComicVine key is configured.
+pub(crate) async fn load_discover_config(db: &Db) -> Result<(DiscoverConfig, HashMap<String, String>)> {
     // Load all settings into a map (parity with the config object).
     let rows = sqlx::query(r#"SELECT key, value FROM "SystemSetting""#).fetch_all(&db.pool).await?;
     let config: HashMap<String, String> = rows.iter()
@@ -343,8 +349,6 @@ pub async fn run_discover_sync(db: Db) -> Result<(i32, String)> {
     let split_lower = |s: &str| -> Vec<String> {
         s.split(',').map(|x| x.trim().to_lowercase()).filter(|x| !x.is_empty()).collect()
     };
-
-    let primary_source = if get("primary_metadata_source").is_empty() { "COMICVINE" } else { get("primary_metadata_source") };
 
     // Node requires a CV key up front regardless of source (queue.ts throws before the source branch).
     let cv_api_key = crate::secret_crypto::decrypt_setting(&db.pool, config.get("cv_api_key").cloned()).await
@@ -363,8 +367,6 @@ pub async fn run_discover_sync(db: Db) -> Result<(i32, String)> {
         split_lower(get("manga_publishers"))
     };
 
-    let client = Client::builder().user_agent("Omnibus/1.0").build()?;
-
     // One filter config for BOTH source branches: the Metron path previously bypassed the
     // blocklists and manga mode entirely (they were ComicVine-only).
     let cfg = DiscoverConfig {
@@ -372,10 +374,21 @@ pub async fn run_discover_sync(db: Db) -> Result<(i32, String)> {
         filter_enabled,
         blocked_publishers: split_lower(get("filter_publishers")),
         blocked_keywords: split_lower(get("filter_keywords")),
-        manga_filter_mode: manga_filter_mode.clone(),
+        manga_filter_mode,
         allowed_manga_pubs: split_lower(get("discover_manga_allowed_publishers")),
         manga_publishers,
     };
+    Ok((cfg, config))
+}
+
+pub async fn run_discover_sync(db: Db) -> Result<(i32, String)> {
+    let (cfg, config) = load_discover_config(&db).await?;
+    let get = |k: &str| config.get(k).map(|s| s.as_str()).unwrap_or("");
+    let primary_source = if get("primary_metadata_source").is_empty() { "COMICVINE" } else { get("primary_metadata_source") };
+    let filter_enabled = cfg.filter_enabled;
+    let manga_filter_mode = cfg.manga_filter_mode.clone();
+
+    let client = Client::builder().user_agent("Omnibus/1.0").build()?;
 
     let (new_releases, popular): (Vec<Value>, Vec<Value>) = if primary_source == "METRON" {
         let metron_user = config.get("metron_user").cloned().unwrap_or_default();

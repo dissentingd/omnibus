@@ -59,6 +59,7 @@ model User {
   koreaderSyncs       KoreaderSync[]
   readerPreferences   ReaderPreference[]
   libraryAccess       UserLibraryAccess[]
+  recommendationDismissals RecommendationDismissal[]
 }
 
 model ApiKey {
@@ -350,6 +351,20 @@ model SeriesCredit {
   @@unique([seriesId, source, kind, providerId])
   @@index([kind, providerId])
   @@index([seriesId])
+}
+
+// A user's "not interested" on a library-aware recommendation (Beta B). Per user — the shelf is
+// library-level, the dismissal is personal — and permanent for that provider volume until undone.
+model RecommendationDismissal {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  source    String   @default("COMICVINE")
+  volumeId  String   // provider volume id, without the 4050- prefix
+  createdAt DateTime @default(now())
+
+  @@unique([userId, source, volumeId])
+  @@index([userId])
 }
 
 model IssueReport {
