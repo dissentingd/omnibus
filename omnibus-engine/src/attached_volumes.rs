@@ -167,6 +167,27 @@ async fn sync_attachment(db: &Db, client: &Client, attachment_id: &str, claim: b
         ..Default::default()
     };
 
+    // The name-anchoring rule needs the parent's name and every attachment's name on this series.
+    // THIS attachment takes the provider's fresh name (its DB name is still empty on the very first
+    // sync); the others keep what earlier syncs stored.
+    let series_name: String = sqlx::query_scalar(r#"SELECT name FROM "Series" WHERE id = $1"#)
+        .bind(&series_id)
+        .fetch_optional(&db.pool)
+        .await?
+        .unwrap_or_default();
+    let name_refs: Vec<AttachmentNameRef> = sqlx::query(r#"SELECT id, name, kind FROM "AttachedVolume" WHERE "seriesId" = $1"#)
+        .bind(&series_id)
+        .fetch_all(&db.pool)
+        .await?
+        .iter()
+        .map(|r| {
+            let id: String = r.get("id");
+            let stored: String = r.try_get::<Option<String>, _>("name").unwrap_or(None).unwrap_or_default();
+            let name = if id == attachment_id { volume.name.clone().unwrap_or(stored) } else { stored };
+            AttachmentNameRef { id, name, kind: r.try_get("kind").unwrap_or_else(|_| "ANNUAL".to_string()) }
+        })
+        .collect();
+
     for issue in &issues {
         // ---- ID-anchored: the row this provider issue already owns, wherever the user moved its
         //      number to. Nothing else in the lane is a candidate.
@@ -196,11 +217,21 @@ async fn sync_attachment(db: &Db, client: &Client, attachment_id: &str, claim: b
             None
         };
 
-        // ---- The claim: a file-backed annual row nobody has bound yet, whose NUMBER matches this
-        //      provider issue. Silent by decision (2026-08-26) — the summary is the honesty, and
-        //      detach / the editor's exact-id field are the undo.
-        let claimed_row = if existing.is_none() && adopted_row.is_none() && claim && kind == "ANNUAL" {
-            find_claim_candidate(db, &series_id, &issue.number).await?
+        // ---- The claim, most specific signal first. By NAME (either kind): a file-backed row
+        //      nobody has bound yet whose filename names THIS volume and parses to this number —
+        //      "The Amazing Spider-Man '96 #001" sitting as main-run #1. Then, annual lanes only,
+        //      by NUMBER: an unbound annual row whose number matches. Silent by decision
+        //      (2026-08-26) — the summary is the honesty, and detach / the editor's exact-id field
+        //      are the undo.
+        let claimed_row = if existing.is_none() && adopted_row.is_none() && claim {
+            match find_claim_candidate_by_name(db, &series_id, &series_name, attachment_id, &name_refs, &issue.number).await? {
+                Some(r) => {
+                    log::info!("[Attached] Claimed a file by NAME for volume {} #{} on series {}.", volume_id, issue.number, series_id);
+                    Some(r)
+                }
+                None if kind == "ANNUAL" => find_claim_candidate(db, &series_id, &issue.number).await?,
+                None => None,
+            }
         } else {
             None
         };
@@ -415,6 +446,95 @@ async fn find_claim_candidate(db: &Db, series_id: &str, number: &str) -> anyhow:
     }))
 }
 
+/// One attached volume as the name-anchoring rule sees it.
+#[derive(Debug, Clone)]
+pub(crate) struct AttachmentNameRef {
+    pub id: String,
+    pub name: String,
+    pub kind: String,
+}
+
+/// Which attachment a filename belongs to by NAME, and the number it parses to under that name.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct AttachmentFileMatch {
+    pub id: String,
+    pub kind: String,
+    pub number: String,
+}
+
+/// #203 name-anchored attachment (anacronismo, 2026-09-09): "The Amazing Spider-Man '96 #001
+/// (1996).cbz" carries no "Annual" token, so it parses as main-run #1 and collides with the 1963 #1
+/// while the attached one-off it belongs to shows "0 of 1 owned". The filename is the only signal,
+/// and a good one: a file whose name STARTS WITH an attached volume's own name belongs to it.
+///   - token-prefix match with the scanner's series-prefix rules (case, separators, glue guard);
+///   - an attachment whose name is itself a token-prefix of the SERIES name (equal included) can
+///     never match, or every main-run file would;
+///   - among several matches the most specific name wins (most tokens, then longest);
+///   - the number is parsed with the attachment's name as the series hint.
+///
+/// Exact twin of attachmentForFilename (src/lib/utils/attachment-name.ts) — keep them identical.
+pub(crate) fn attachment_for_filename(file_name: &str, series_name: &str, attachments: &[AttachmentNameRef]) -> Option<AttachmentFileMatch> {
+    let token_count = |s: &str| s.split(|c: char| !c.is_ascii_alphanumeric()).filter(|t| !t.is_empty()).count();
+    let mut best: Option<(&AttachmentNameRef, usize, usize)> = None;
+    for a in attachments {
+        let name = a.name.trim();
+        if name.is_empty() {
+            continue;
+        }
+        // The parent's own name — or a shorter prefix of it — names the parent's files, not a lane's.
+        if crate::scanner::strip_series_prefix(series_name, name).is_some() {
+            continue;
+        }
+        if crate::scanner::strip_series_prefix(file_name, name).is_none() {
+            continue;
+        }
+        let (tokens, len) = (token_count(name), name.len());
+        if best.is_none_or(|(_, t, l)| tokens > t || (tokens == t && len > l)) {
+            best = Some((a, tokens, len));
+        }
+    }
+    let (a, _, _) = best?;
+    let (number, _) = crate::scanner::issue_descriptor_from_filename(file_name, Some(a.name.trim()));
+    Some(AttachmentFileMatch { id: a.id.clone(), kind: a.kind.clone(), number })
+}
+
+/// The name-anchored claim: a file-backed row bound to no attachment — main run OR annual — whose
+/// FILENAME names this attached volume and parses to `number` under it. Runs before the
+/// number-anchored annual claim, because a name is the more specific signal.
+async fn find_claim_candidate_by_name(
+    db: &Db,
+    series_id: &str,
+    series_name: &str,
+    attachment_id: &str,
+    attachments: &[AttachmentNameRef],
+    number: &str,
+) -> anyhow::Result<Option<sqlx::any::AnyRow>> {
+    let rows = sqlx::query(
+        r#"SELECT id, number, name, description, "releaseDate", "coverUrl", "matchState",
+                  CAST("hasCustomMetadata" AS INTEGER) AS "hasCustomMetadata",
+                  CAST("hasCustomCover" AS INTEGER) AS "hasCustomCover",
+                  writers, artists, "coverArtists", colorists, letterers, characters, teams, locations,
+                  inker, editor, translator, "filePath"
+           FROM "Issue"
+           WHERE "seriesId" = $1 AND "attachedVolumeId" IS NULL AND "filePath" IS NOT NULL AND "filePath" <> ''"#,
+    )
+    .bind(series_id)
+    .fetch_all(&db.pool)
+    .await?;
+
+    Ok(rows.into_iter().find(|r| {
+        let file: String = r.try_get("filePath").unwrap_or_default();
+        let base = std::path::Path::new(&file)
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+        matches!(
+            attachment_for_filename(&base, series_name, attachments),
+            Some(m) if m.id == attachment_id && is_same_issue(&m.number, number)
+        )
+    }))
+}
+
 /// ComicVine: the volume's own facts plus every issue in it (the same paginated list the parent
 /// lane walks — credits ride along in the list call at no extra API cost, issue #179).
 async fn fetch_comicvine_lane(db: &Db, client: &Client, volume_id: &str) -> anyhow::Result<(LaneVolume, Vec<LaneIssue>)> {
@@ -598,6 +718,75 @@ mod tests {
             sqlx::query(ddl).execute(&db.pool).await.expect("create schema");
         }
         db
+    }
+
+    // ==== #203 name-anchored attachment. The rule's cases are the EXACT twin of
+    // __tests__/lib/utils/attachment-name.test.ts — keep both in step. ====
+
+    fn aref(id: &str, name: &str, kind: &str) -> AttachmentNameRef {
+        AttachmentNameRef { id: id.into(), name: name.into(), kind: kind.into() }
+    }
+    const ASM: &str = "The Amazing Spider-Man";
+
+    #[test]
+    fn name_rule_claims_the_96_one_off_and_parses_its_number_under_that_name() {
+        let refs = [aref("attAnn", "The Amazing Spider-Man Annual", "ANNUAL"), aref("att96", "The Amazing Spider-Man '96", "ANNUAL")];
+        assert_eq!(
+            attachment_for_filename("The Amazing Spider-Man '96 #001 (1996).cbz", ASM, &refs),
+            Some(AttachmentFileMatch { id: "att96".into(), kind: "ANNUAL".into(), number: "1".into() })
+        );
+        // The filename that IS just the volume name is that volume's one-shot.
+        assert_eq!(attachment_for_filename("The Amazing Spider-Man '96 (1996).cbz", ASM, &refs[1..]).map(|m| m.number), Some("1".into()));
+        // Case and separators are the scanner's rules, not the user's typing.
+        assert_eq!(attachment_for_filename("the amazing spider-man '96 - 001.cbz", ASM, &refs[1..]).map(|m| m.number), Some("1".into()));
+    }
+
+    #[test]
+    fn name_rule_never_hands_the_parents_own_files_to_a_lane() {
+        let refs = [aref("att96", "The Amazing Spider-Man '96", "ANNUAL"), aref("attAnn", "The Amazing Spider-Man Annual", "ANNUAL"), aref("attTpb", "The Amazing Spider-Man: Coming Home", "COLLECTED")];
+        assert!(attachment_for_filename("The Amazing Spider-Man #001 (1963).cbz", ASM, &refs).is_none());
+        // An attachment named exactly like the series (or a prefix of it) can never match.
+        assert!(attachment_for_filename("The Amazing Spider-Man #001 (1963).cbz", ASM, &[aref("same", "The Amazing Spider-Man", "COLLECTED")]).is_none());
+        assert!(attachment_for_filename("Amazing Spider-Man #001 (1963).cbz", "Amazing Spider-Man Annual", &[aref("short", "Amazing Spider-Man", "COLLECTED")]).is_none());
+    }
+
+    #[test]
+    fn name_rule_respects_the_glue_guard_and_token_boundaries() {
+        // "'96" is a token; "1996" is a different token → not the '96 volume.
+        assert!(attachment_for_filename("The Amazing Spider-Man 1996 #001 (1996).cbz", ASM, &[aref("att96", "The Amazing Spider-Man '96", "ANNUAL")]).is_none());
+        // "Annuals" is not "Annual" (glue guard).
+        assert!(attachment_for_filename("The Amazing Spider-Man Annuals #001.cbz", ASM, &[aref("attAnn", "The Amazing Spider-Man Annual", "ANNUAL")]).is_none());
+    }
+
+    #[test]
+    fn name_rule_prefers_the_most_specific_name_and_carries_the_kind() {
+        let annual = aref("a", "X-Men Annual", "ANNUAL");
+        let annual95 = aref("a95", "X-Men Annual '95", "ANNUAL");
+        assert_eq!(attachment_for_filename("X-Men Annual '95 #001 (1995).cbz", "X-Men", &[annual.clone(), annual95.clone()]).map(|m| m.id), Some("a95".into()));
+        assert_eq!(attachment_for_filename("X-Men Annual #003 (1979).cbz", "X-Men", &[annual95, annual]).map(|m| m.id), Some("a".into()));
+        assert_eq!(
+            attachment_for_filename("The Amazing Spider-Man: Coming Home Vol. 1.cbz", ASM, &[aref("attTpb", "The Amazing Spider-Man: Coming Home", "COLLECTED")]),
+            Some(AttachmentFileMatch { id: "attTpb".into(), kind: "COLLECTED".into(), number: "1".into() })
+        );
+        // Nameless attachments are skipped.
+        assert_eq!(attachment_for_filename("The Amazing Spider-Man '96 #001.cbz", ASM, &[aref("x", "", "ANNUAL"), aref("z", "The Amazing Spider-Man '96", "ANNUAL")]).map(|m| m.id), Some("z".into()));
+    }
+
+    #[tokio::test]
+    async fn name_claim_finds_the_unbound_row_whose_file_names_this_volume_and_number() {
+        let db = fixture("nameclaim").await;
+        // The field shape: the '96 file scanned as MAIN-RUN #1 next to the real 1963 #1.
+        insert_issue(&db, "row96", "1", false, Some("/c/ASM/The Amazing Spider-Man '96 #001 (1996).cbz"), None, Some("unmatched_a")).await;
+        insert_issue(&db, "row63", "1", false, Some("/c/ASM/The Amazing Spider-Man #001 (1963).cbz"), None, Some("300001")).await;
+        // Already bound rows are never candidates, whatever they are named.
+        insert_issue(&db, "bound", "1", true, Some("/c/ASM/The Amazing Spider-Man '96 #001 (1996).cbz"), Some("other"), Some("400001")).await;
+        let refs = [aref("att96", "The Amazing Spider-Man '96", "ANNUAL"), aref("attAnn", "The Amazing Spider-Man Annual", "ANNUAL")];
+
+        let hit = find_claim_candidate_by_name(&db, "s1", ASM, "att96", &refs, "1").await.unwrap();
+        assert_eq!(hit.map(|r| r.get::<String, _>("id")), Some("row96".to_string()));
+        // The same file is nobody else's: the Annual lane sees nothing for #1, and '96 has no #2.
+        assert!(find_claim_candidate_by_name(&db, "s1", ASM, "attAnn", &refs, "1").await.unwrap().is_none());
+        assert!(find_claim_candidate_by_name(&db, "s1", ASM, "att96", &refs, "2").await.unwrap().is_none());
     }
 
     async fn insert_issue(db: &Db, id: &str, number: &str, annual: bool, file: Option<&str>, attached: Option<&str>, meta_id: Option<&str>) {

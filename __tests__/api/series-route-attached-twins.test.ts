@@ -23,6 +23,7 @@ vi.mock('@/lib/db', () => ({
         library: { findMany: vi.fn() },
         series: { findFirst: vi.fn(), findUnique: vi.fn(), findMany: vi.fn() },
         issue: { findMany: vi.fn(), deleteMany: vi.fn(), createMany: vi.fn(), update: vi.fn() },
+        attachedVolume: { findMany: vi.fn(async () => []) },
         favorite: { findUnique: vi.fn() },
         seriesFollow: { findUnique: vi.fn() },
         readProgress: { findMany: vi.fn() },
@@ -104,5 +105,25 @@ describe('#203 beta.010 regression: attached-lane rows vs. the folder file sync'
         expect(rows).toHaveLength(1);
         expect(rows[0]).toEqual(expect.objectContaining({ number: '5', isAnnual: false, filePath: expect.stringContaining('Batman #005 (2011).cbz') }));
         expect(deletedIds()).toEqual([]);
+    });
+
+    // #203 name-anchored (anacronismo): a one-off named like its parent carries no Annual token.
+    it("keys a file named after an attached volume as that lane — no '96-vs-1963 \"#1 duplicate\", and a new file lands in the lane's domain", async () => {
+        const ASM = '/comics/ASM';
+        (prisma.series.findFirst as any).mockResolvedValue({
+            id: 's1', name: 'The Amazing Spider-Man', year: 1963, folderPath: ASM, metadataId: '2350', metadataSource: 'COMICVINE',
+        });
+        (prisma.attachedVolume.findMany as any).mockResolvedValue([{ id: 'att96', name: "The Amazing Spider-Man '96", kind: 'ANNUAL' }]);
+        (prisma.issue.findMany as any).mockResolvedValue([
+            { id: 'main1', number: '1', isAnnual: false, metadataId: '300001', filePath: `${ASM}/The Amazing Spider-Man #001 (1963).cbz`, attachedVolumeId: null },
+        ]);
+        disk.files = ['The Amazing Spider-Man #001 (1963).cbz', "The Amazing Spider-Man '96 #001 (1996).cbz"];
+
+        const body = await (await GET(getReq(`http://localhost/api/library/series?path=${encodeURIComponent(ASM)}`))).json();
+        // Two files, two slots: the '96 file is the lane's #1, not a second main-run #1.
+        expect(body.duplicates).toEqual([]);
+        const rows = created();
+        expect(rows).toHaveLength(1);
+        expect(rows[0]).toEqual(expect.objectContaining({ number: '1', isAnnual: true, filePath: expect.stringContaining("'96 #001") }));
     });
 });

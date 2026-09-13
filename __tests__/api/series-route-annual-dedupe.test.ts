@@ -21,6 +21,7 @@ vi.mock('@/lib/db', () => ({
         library: { findMany: vi.fn() },
         series: { findFirst: vi.fn(), findUnique: vi.fn(), findMany: vi.fn() },
         issue: { findMany: vi.fn(), deleteMany: vi.fn(), createMany: vi.fn(), update: vi.fn() },
+        attachedVolume: { findMany: vi.fn(async () => []) },
         favorite: { findUnique: vi.fn() },
         seriesFollow: { findUnique: vi.fn() },
         readProgress: { findMany: vi.fn() },

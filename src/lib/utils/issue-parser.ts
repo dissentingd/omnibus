@@ -36,7 +36,9 @@ export function isSameIssue(num1: string | number, num2: string | number): boole
 // remainder — or null when the series name isn't a clean prefix (including when a token would be
 // glued into a longer word: series "No" must never half-consume "Nova"). Tokens are the series
 // name's alphanumeric runs, so "Kaiju No. 8" matches "Kaiju No.8", "kaiju_no_8", etc.
-function stripSeriesPrefix(filename: string, seriesName: string): string | null {
+// Shared with the attached lane's name-anchored rule (attachment-name.ts) — the same token rule
+// decides what a filename names. Parity twin: omnibus-engine scanner.rs strip_series_prefix.
+export function stripSeriesPrefix(filename: string, seriesName: string): string | null {
     const tokens = seriesName.toLowerCase().match(/[a-z0-9]+/g);
     if (!tokens || tokens.length === 0) return null;
     const lower = filename.toLowerCase();

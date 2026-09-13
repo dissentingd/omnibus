@@ -1098,7 +1098,10 @@ fn strip_leading_zeros(s: &str) -> String {
 /// glued into a longer word: series "No" must never half-consume "Nova"). Tokens are the series
 /// name's ASCII-alphanumeric runs, so "Kaiju No. 8" matches "Kaiju No.8", "kaiju_no_8", etc.
 /// Non-ASCII series names yield no tokens and never strip — a safe no-op.
-fn strip_series_prefix(file_name: &str, series: &str) -> Option<String> {
+/// Token-prefix match: `Some(rest)` when `file_name` starts with every token of `series` (case and
+/// separators ignored, glue-guarded so "Batman" never matches "Batmanx"). Shared with the attached
+/// lane's name-anchored claim (attached_volumes.rs) — the same rule decides what a filename names.
+pub(crate) fn strip_series_prefix(file_name: &str, series: &str) -> Option<String> {
     let tokens: Vec<String> = series
         .split(|c: char| !c.is_ascii_alphanumeric())
         .filter(|s| !s.is_empty())
@@ -1130,7 +1133,7 @@ fn issue_number_from_filename(file_name: &str, series_hint: Option<&str>) -> Str
     issue_descriptor_from_filename(file_name, series_hint).0
 }
 
-fn issue_descriptor_from_filename(file_name: &str, series_hint: Option<&str>) -> (String, bool) {
+pub(crate) fn issue_descriptor_from_filename(file_name: &str, series_hint: Option<&str>) -> (String, bool) {
     // Issue #200: "#½" must parse as "#0.5" instead of falling through every digit rule to the
     // "1" default. Normalized once here (idempotent through the recursive hint call below).
     let normalized = crate::metadata::normalize_fraction_numbers(file_name);

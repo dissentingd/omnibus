@@ -11,6 +11,7 @@ import { Logger } from '@/lib/logger';
 import { getErrorMessage } from '@/lib/utils/error';
 import { AuditLogger } from '@/lib/audit-logger';
 import { describeIssueFromFilename, normalizeFractionNumbers } from '@/lib/utils/issue-parser';
+import { attachmentForFilename } from '@/lib/utils/attachment-name';
 import { COMIC_EXT_REGEX } from '@/lib/utils/formats';
 import { sanitizeDescription, providerWikiBase } from '@/lib/utils/sanitize';
 import { safeParse } from '@/lib/utils/safe-parse';
@@ -201,6 +202,16 @@ export async function GET(request: Request) {
         if (folderExists) {
             const files = await fs.promises.readdir(folderPath);
 
+            // #203 name-anchored: which attached volume a FILENAME belongs to — a one-off named like
+            // its parent ("The Amazing Spider-Man '96 #001") carries no Annual token, and the name
+            // is the only signal. Such a file keys as its lane, so it never groups with the main
+            // run's same number (the '96-vs-1963 "#1 duplicate" from the field report), and if it
+            // has no row yet it is created in the lane's domain for the engine's claim to bind.
+            const attachmentRefs = await prisma.attachedVolume.findMany({
+                where: { seriesId: seriesRecord.id },
+                select: { id: true, name: true, kind: true },
+            });
+
             const filesByNum = new Map<string, { number: string; isAnnual: boolean; files: string[] }>();
             for (const file of files) {
                 if (COMIC_EXT_REGEX.test(file)) {
@@ -208,8 +219,11 @@ export async function GET(request: Request) {
                     // without it every volume parsed as #8 and collapsed into one dup-flagged row.
                     // #203: files group by (annual domain, number) — "Batman Annual 001" and
                     // "Batman 001" are different slots, not a duplicate pair.
-                    const desc = describeIssueFromFilename(file, seriesRecord?.name || undefined);
-                    const key = `${desc.isAnnual ? 'annual:' : ''}${desc.number}`;
+                    const lane = attachmentRefs.length > 0 ? attachmentForFilename(file, seriesRecord?.name || '', attachmentRefs) : null;
+                    const desc = lane
+                        ? { number: lane.number, isAnnual: lane.kind === 'ANNUAL' }
+                        : describeIssueFromFilename(file, seriesRecord?.name || undefined);
+                    const key = lane ? `att:${lane.id}:${desc.number}` : `${desc.isAnnual ? 'annual:' : ''}${desc.number}`;
                     const entry = filesByNum.get(key);
                     if (entry) entry.files.push(file);
                     else filesByNum.set(key, { number: desc.number, isAnnual: desc.isAnnual, files: [file] });
@@ -262,11 +276,15 @@ export async function GET(request: Request) {
         if (updateOperations.length > 0) await Promise.all(updateOperations);
 
         if (folderExists) {
+            // Both slash forms: the engine stores forward slashes on every platform, path.join emits
+            // the platform's — on a Windows dev box the raw form alone would miss every engine-written
+            // row and prune a file that is plainly on disk.
+            const activeBothForms = Array.from(activeFilePaths as Set<string>).flatMap(p => [p, samePath(p)]);
             await prisma.issue.deleteMany({
                 where: {
                     seriesId: seriesRecord.id,
                     metadataId: { startsWith: 'unmatched_' },
-                    filePath: { notIn: Array.from(activeFilePaths) as string[] }
+                    filePath: { notIn: activeBothForms }
                 }
             }).catch(() => {});
         }
