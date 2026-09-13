@@ -117,6 +117,25 @@ export async function GET(request: Request) {
         const dbIssueMap = new Map();
         const idsToDelete: string[] = [];
 
+        // beta.010 REGRESSION HEAL (#203, anacronismo 2026-09-10). Rows of an ATTACHED lane are keyed
+        // `att:<attachment>:<n>` below, but the folder's FILES can only be keyed `annual:<n>` / `<n>` —
+        // so once an attach had claimed an annual file, every visit here failed to find that file's
+        // row under its file key and created a second, unmatched row for the SAME path (the
+        // Diagnostics screenshot: one path listed twice; "38 local annual files still unattached").
+        // A file has one row: an unattached row sharing its path with an attached one is that twin,
+        // and it goes. The path-first file sync further down is what stops new twins being born.
+        const samePath = (p: string) => p.replace(/\\/g, '/');
+        const attachedPaths = new Set<string>(
+            existingIssues.filter(i => i.attachedVolumeId && i.filePath).map(i => samePath(i.filePath))
+        );
+        const twinIds = existingIssues
+            .filter(i => !i.attachedVolumeId && i.filePath && attachedPaths.has(samePath(i.filePath)))
+            .map(i => i.id);
+        if (twinIds.length > 0) {
+            await prisma.issue.deleteMany({ where: { id: { in: twinIds } } }).catch(() => {});
+            existingIssues = existingIssues.filter(i => !twinIds.includes(i.id));
+        }
+
         // #203: the annual domain is part of the grouping key ("annual:1" vs "1") — before this,
         // a co-located "Batman Annual 001" and the real #1 landed in one group and the ranking
         // DELETED one of the rows every visit (row churn). ':' can't appear in a number, so the
@@ -171,6 +190,14 @@ export async function GET(request: Request) {
         const activeFilePaths = new Set();
         const creatingNums = new Set();
 
+        // Every surviving row's path, so the file sync can recognise an indexed file BEFORE it
+        // consults the number key. An attached row's key is its lane, which a bare filename can
+        // never produce — keying alone is exactly what created the twins healed above.
+        const deletedIds = new Set(idsToDelete);
+        const indexedPaths = new Set<string>(
+            existingIssues.filter(i => i.filePath && !deletedIds.has(i.id)).map(i => samePath(i.filePath))
+        );
+
         if (folderExists) {
             const files = await fs.promises.readdir(folderPath);
 
@@ -201,6 +228,10 @@ export async function GET(request: Request) {
                 const file = group.files[0];
                 const fullPath = path.join(folderPath, file);
                 activeFilePaths.add(fullPath);
+
+                // Path first: a file that already belongs to a row — attached lane or not — is
+                // indexed, whatever key its filename parses to.
+                if (indexedPaths.has(samePath(fullPath))) continue;
 
                 const existingIssue = dbIssueMap.get(key);
 

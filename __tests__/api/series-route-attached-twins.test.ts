@@ -1,0 +1,108 @@
+// /api/library/series (GET reconciler) — the beta.010 regression (#203, anacronismo 2026-09-10).
+// Rows of an ATTACHED lane are keyed `att:<attachment>:<n>`, but the folder's files can only be
+// keyed `annual:<n>` / `<n>`, so after an attach had claimed an annual file every visit created a
+// second, unmatched row for the SAME path. These pin the two halves of the fix: the file sync
+// recognises an indexed file by PATH before it consults the number key, and an existing twin is
+// healed on the next visit — while the behaviours the key match exists for still work.
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { GET } from '@/app/api/library/series/route';
+import { prisma } from '@/lib/db';
+import { getReq } from '../helpers/request';
+
+vi.mock('next-auth/next', () => ({ getServerSession: vi.fn().mockResolvedValue(null) }));
+vi.mock('@/app/api/auth/[...nextauth]/options', () => ({ getAuthOptions: vi.fn(async () => ({})) }));
+vi.mock('@/lib/logger', () => ({ Logger: { log: vi.fn() } }));
+vi.mock('@/lib/audit-logger', () => ({ AuditLogger: { log: vi.fn() } }));
+vi.mock('@/lib/library-access', () => ({
+    getAccessibleLibraryPaths: vi.fn(async () => []),
+    canAccessPath: vi.fn(() => true),
+}));
+
+vi.mock('@/lib/db', () => ({
+    prisma: {
+        library: { findMany: vi.fn() },
+        series: { findFirst: vi.fn(), findUnique: vi.fn(), findMany: vi.fn() },
+        issue: { findMany: vi.fn(), deleteMany: vi.fn(), createMany: vi.fn(), update: vi.fn() },
+        favorite: { findUnique: vi.fn() },
+        seriesFollow: { findUnique: vi.fn() },
+        readProgress: { findMany: vi.fn() },
+    }
+}));
+
+// The folder EXISTS here — the file sync is the subject. `files` is what readdir answers.
+const disk = vi.hoisted(() => ({ files: [] as string[] }));
+vi.mock('fs-extra', () => ({
+    default: {
+        existsSync: vi.fn(() => true),
+        promises: { readdir: vi.fn(async () => disk.files), access: vi.fn(async () => undefined) },
+    }
+}));
+
+const FOLDER = '/comics/Batman';
+const ANNUAL_FILE = `${FOLDER}/Batman Annual #001 (2012).cbz`;
+
+describe('#203 beta.010 regression: attached-lane rows vs. the folder file sync', () => {
+    beforeEach(() => {
+        vi.clearAllMocks();
+        disk.files = [];
+        (prisma.library.findMany as any).mockResolvedValue([{ id: 'lib1', path: '/comics' }]);
+        (prisma.series.findFirst as any).mockResolvedValue({
+            id: 's1', name: 'Batman', year: 2011, folderPath: FOLDER, metadataId: '42821', metadataSource: 'COMICVINE',
+        });
+        (prisma.issue.deleteMany as any).mockResolvedValue({ count: 0 });
+        (prisma.issue.createMany as any).mockResolvedValue({ count: 0 });
+        (prisma.issue.update as any).mockResolvedValue({});
+    });
+
+    const deletedIds = () => (prisma.issue.deleteMany as any).mock.calls.flatMap((c: any[]) => c[0]?.where?.id?.in || []);
+    const created = () => (prisma.issue.createMany as any).mock.calls.flatMap((c: any[]) => c[0]?.data || []);
+
+    it("an attached annual's file on disk is recognised by PATH — never re-created under its file key", async () => {
+        (prisma.issue.findMany as any).mockResolvedValue([
+            // Claimed by the "Batman Annual (2012)" lane: keyed att:att1:1, which the filename can't produce.
+            { id: 'claimed', number: '1', isAnnual: true, metadataId: '400001', filePath: ANNUAL_FILE, attachedVolumeId: 'att1' },
+            { id: 'main1', number: '1', isAnnual: false, metadataId: '300001', filePath: `${FOLDER}/Batman #001 (2011).cbz`, attachedVolumeId: null },
+        ]);
+        disk.files = ['Batman Annual #001 (2012).cbz', 'Batman #001 (2011).cbz'];
+
+        const res = await GET(getReq(`http://localhost/api/library/series?path=${encodeURIComponent(FOLDER)}`));
+        expect(res.status).toBe(200);
+        expect(created()).toEqual([]);                      // the regression: a second row for ANNUAL_FILE
+        expect(prisma.issue.update).not.toHaveBeenCalled();  // nothing to re-point either
+        expect(deletedIds()).toEqual([]);
+    });
+
+    it('a twin the regression already made is healed: the unattached row sharing an attached row\'s path goes', async () => {
+        (prisma.issue.findMany as any).mockResolvedValue([
+            { id: 'claimed', number: '1', isAnnual: true, metadataId: '400001', filePath: ANNUAL_FILE, attachedVolumeId: 'att1' },
+            // Born by an earlier visit: unmatched, same file. The Diagnostics "same path twice".
+            { id: 'twin', number: '1', isAnnual: true, metadataId: 'unmatched_abc', filePath: ANNUAL_FILE, attachedVolumeId: null },
+            // A different annual file with NO attachment is not a twin of anything.
+            { id: 'loner', number: '2', isAnnual: true, metadataId: 'unmatched_def', filePath: `${FOLDER}/Batman Annual #002 (2013).cbz`, attachedVolumeId: null },
+        ]);
+        disk.files = ['Batman Annual #001 (2012).cbz', 'Batman Annual #002 (2013).cbz'];
+
+        await GET(getReq(`http://localhost/api/library/series?path=${encodeURIComponent(FOLDER)}`));
+        expect(deletedIds()).toEqual(['twin']);
+        expect(created()).toEqual([]);
+        expect(prisma.issue.update).not.toHaveBeenCalled();
+    });
+
+    it('the key match still does its job: a WANTED row receives its file, and a file with no row is created', async () => {
+        (prisma.issue.findMany as any).mockResolvedValue([
+            // Provider skeleton for annual #1, no file yet — the file on disk should be handed to it.
+            { id: 'wanted', number: '1', isAnnual: true, metadataId: '400001', filePath: null, attachedVolumeId: null },
+        ]);
+        disk.files = ['Batman Annual #001 (2012).cbz', 'Batman #005 (2011).cbz'];
+
+        await GET(getReq(`http://localhost/api/library/series?path=${encodeURIComponent(FOLDER)}`));
+        expect(prisma.issue.update).toHaveBeenCalledWith(expect.objectContaining({
+            where: { id: 'wanted' },
+            data: expect.objectContaining({ filePath: expect.stringContaining('Batman Annual #001 (2012).cbz') }),
+        }));
+        const rows = created();
+        expect(rows).toHaveLength(1);
+        expect(rows[0]).toEqual(expect.objectContaining({ number: '5', isAnnual: false, filePath: expect.stringContaining('Batman #005 (2011).cbz') }));
+        expect(deletedIds()).toEqual([]);
+    });
+});

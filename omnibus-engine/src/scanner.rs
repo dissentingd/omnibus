@@ -722,6 +722,22 @@ fn restamp_credit_complete_sql() -> &'static str {
          AND "seriesId" IN (SELECT id FROM "Series" WHERE "libraryId" = $1)"#
 }
 
+/// 5K (#203, the beta.010 regression — anacronismo 2026-09-10): deletes the TWIN rows the Node
+/// series-page sync used to create — an unattached row sharing its file with a row that belongs to
+/// an attached lane. A file has ONE row; the attached one carries the provider link the user made
+/// by hand, so it is the one that stays. Library-scoped like every other scan pass; portable
+/// correlated subquery (no DELETE … JOIN, which SQLite lacks).
+fn attached_twin_heal_sql() -> &'static str {
+    r#"DELETE FROM "Issue"
+       WHERE "attachedVolumeId" IS NULL
+         AND "filePath" IS NOT NULL AND "filePath" <> ''
+         AND "seriesId" IN (SELECT id FROM "Series" WHERE "libraryId" = $1)
+         AND EXISTS (SELECT 1 FROM "Issue" o
+                     WHERE o."seriesId" = "Issue"."seriesId"
+                       AND o."attachedVolumeId" IS NOT NULL
+                       AND o."filePath" = "Issue"."filePath")"#
+}
+
 fn issue_file_meta(info: Option<&ScanComicInfo>) -> IssueFileMeta {
     let Some(i) = info else { return IssueFileMeta::default() };
     let text = |s: &Option<String>| s.as_deref().map(str::trim).filter(|t| !t.is_empty()).map(str::to_string);
@@ -2760,6 +2776,22 @@ pub async fn scan_library(db: Db, library_path: String, library_id: String, spec
     }
 
     // ---------------------------------------------------------
+    // 5K. HEAL ATTACHED-LANE TWINS (#203 — the beta.010 regression, anacronismo 2026-09-10)
+    // ---------------------------------------------------------
+    // The Node series-page sync keyed an attached lane's rows by their lane but the folder's files
+    // by their filename, so every visit after an attach created a second, unmatched row for the
+    // SAME path ("38 local annual files still unattached"; Diagnostics listing one path twice).
+    // The route now matches by path and heals its own series on the next visit; this pass heals the
+    // whole library in one scan, so nobody has to open every series to get clean.
+    match sqlx::query(attached_twin_heal_sql()).bind(&library_id).execute(&db.pool).await {
+        Ok(r) if r.rows_affected() > 0 => {
+            log::info!("[Scan] Healed {} attached-lane twin row(s): unattached rows that shared a file with an attached row (#203, beta.010 regression).", r.rows_affected());
+        }
+        Ok(_) => {}
+        Err(e) => log::warn!("[Scan] Attached-lane twin heal failed: {:?}", e),
+    }
+
+    // ---------------------------------------------------------
     // 5G. RE-STAMP CREDIT-COMPLETE ISSUES (discussion #182 — local-first ingest)
     // ---------------------------------------------------------
     // Libraries scanned by pre-beta.090 builds carry issues whose ComicInfo credits already sit in
@@ -3085,6 +3117,47 @@ mod tests {
             .fetch_all(&pool).await.unwrap()
             .iter().map(|r| r.get::<String, _>("id")).collect();
         assert_eq!(promoted, vec!["i1", "i2", "i6"]);
+    }
+
+    // ==== #203, the beta.010 regression: the 5K twin heal deletes exactly the unattached rows that
+    // share a file with an attached-lane row, in this library only. ====
+    #[tokio::test]
+    async fn attached_twin_heal_deletes_only_unattached_rows_sharing_an_attached_rows_file() {
+        static INIT: std::sync::Once = std::sync::Once::new();
+        INIT.call_once(sqlx::any::install_default_drivers);
+        let pool = sqlx::any::AnyPoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:").await.unwrap();
+        sqlx::query(r#"CREATE TABLE "Series" (id TEXT PRIMARY KEY, "libraryId" TEXT)"#).execute(&pool).await.unwrap();
+        sqlx::query(r#"CREATE TABLE "Issue" (id TEXT PRIMARY KEY, "seriesId" TEXT, "filePath" TEXT, "attachedVolumeId" TEXT)"#).execute(&pool).await.unwrap();
+        for (id, lib) in [("s1", "lib1"), ("s2", "lib1"), ("s3", "lib2")] {
+            sqlx::query(r#"INSERT INTO "Series" (id, "libraryId") VALUES ($1, $2)"#).bind(id).bind(lib).execute(&pool).await.unwrap();
+        }
+        for (id, sid, fp, att) in [
+            // s1: the claimed annual and the twin the old page sync made for the same file.
+            ("claimed", "s1", Some("/c/s1/Annual 001.cbz"), Some("att1")),
+            ("twin", "s1", Some("/c/s1/Annual 001.cbz"), None::<&str>),
+            // s1: an unattached annual with its own file — nobody's twin.
+            ("loner", "s1", Some("/c/s1/Annual 002.cbz"), None),
+            // s1: a WANTED skeleton in the lane (no file) and a main-run file — untouched.
+            ("skeleton", "s1", None::<&str>, Some("att1")),
+            ("main", "s1", Some("/c/s1/001.cbz"), None),
+            // s2: same path text as s1's annual but a different series — a twin only within ITS series.
+            ("other_series", "s2", Some("/c/s1/Annual 001.cbz"), None),
+            // s3 (other library): a real twin, but out of this scan's scope.
+            ("foreign_claimed", "s3", Some("/c/s3/Annual 001.cbz"), Some("att3")),
+            ("foreign_twin", "s3", Some("/c/s3/Annual 001.cbz"), None),
+        ] {
+            sqlx::query(r#"INSERT INTO "Issue" (id, "seriesId", "filePath", "attachedVolumeId") VALUES ($1, $2, $3, $4)"#)
+                .bind(id).bind(sid).bind(fp).bind(att).execute(&pool).await.unwrap();
+        }
+
+        let res = sqlx::query(attached_twin_heal_sql()).bind("lib1").execute(&pool).await.unwrap();
+        assert_eq!(res.rows_affected(), 1, "exactly the twin goes");
+        let left: Vec<String> = sqlx::query(r#"SELECT id FROM "Issue" ORDER BY id"#)
+            .fetch_all(&pool).await.unwrap()
+            .iter().map(|r| r.get::<String, _>("id")).collect();
+        assert_eq!(left, vec!["claimed", "foreign_claimed", "foreign_twin", "loner", "main", "other_series", "skeleton"]);
     }
 
     #[tokio::test]
