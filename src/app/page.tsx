@@ -7,6 +7,7 @@ import { RequestSearch } from "@/components/request-search"
 import { ComicGrid } from "@/components/comic-grid"
 import { ContinueReading } from "@/components/ContinueReading"
 import { RecommendationsShelf } from "@/components/recommendations-shelf"
+import { ForYouShelf } from "@/components/for-you-shelf"
 import { RecentlyAdded } from "@/components/recently-added"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Badge } from "@/components/ui/badge"
@@ -453,6 +454,12 @@ export default function Home() {
         {/* Recommendations Shelf */}
         <div className="w-full relative z-10">
           <RecommendationsShelf refreshSignal={refreshSignal} />
+        </div>
+
+        {/* For Your Library — series the library lacks, ranked from its own credits (field report by
+            robotshavehearts2). Stays out of the way until the engine has built a list. */}
+        <div className="w-full relative z-10">
+          <ForYouShelf refreshSignal={refreshSignal} />
         </div>
 
         {/* Recently Added Shelf */}

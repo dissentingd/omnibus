@@ -13,7 +13,8 @@ import {
     ArrowLeft, Calendar, Loader2, Play, Save, Database, ShieldAlert, 
     Activity, RefreshCw, FileText, ExternalLink, Download, 
     UploadCloud, TrendingUp, FileArchive, FileJson, Mail, Layers, Globe, Settings, Trash2,
-    FolderInput, HeartPulse // <-- ADDED new icons
+    FolderInput, HeartPulse, // <-- ADDED new icons
+    Sparkles
 } from "lucide-react"
 import { getErrorMessage } from "@/lib/utils/error"
 
@@ -175,7 +176,7 @@ export default function ScheduledJobsPage() {
   };
 
   // --- ADDED: Updated signature payload to accept the two new job triggers ---
-  const handleRunJob = async (job: 'metadata' | 'library' | 'monitor' | 'diagnostics' | 'backup' | 'popular' | 'converter' | 'embed_metadata' | 'export_series_json' | 'weekly_digest' | 'watched_sync' | 'health_check' | 'cache_cleanup') => {
+  const handleRunJob = async (job: 'metadata' | 'library' | 'monitor' | 'diagnostics' | 'backup' | 'popular' | 'for_you' | 'converter' | 'embed_metadata' | 'export_series_json' | 'weekly_digest' | 'watched_sync' | 'health_check' | 'cache_cleanup') => {
       setRunningJob(job);
       toast({ title: "Job Started", description: `The ${job} process has been triggered in the background.` });
       try {
@@ -454,6 +455,18 @@ export default function ScheduledJobsPage() {
                         </Select>
                         <Button className="w-full font-bold border-border hover:bg-muted" variant="outline" onClick={() => handleRunJob('popular')} disabled={runningJob === 'popular'}>
                             {runningJob === 'popular' ? <Loader2 className="w-4 h-4 animate-spin"/> : <Play className="w-4 h-4 mr-2"/>} Run Now
+                        </Button>
+                    </CardContent>
+                </Card>
+
+                <Card className="shadow-sm border-border bg-background transition-all hover:shadow-md">
+                    <CardHeader className="pb-3">
+                        <CardTitle className="flex items-center gap-2 text-lg text-foreground"><Sparkles className="w-5 h-5 text-primary" /> For Your Library</CardTitle>
+                        <CardDescription className="text-muted-foreground">Ranks series you don&apos;t have from your library&apos;s creators and characters. Runs on the Discover Sync schedule above.</CardDescription>
+                    </CardHeader>
+                    <CardContent className="space-y-4">
+                        <Button className="w-full font-bold border-border hover:bg-muted" variant="outline" onClick={() => handleRunJob('for_you')} disabled={runningJob === 'for_you'} aria-label="Build the For Your Library recommendations now">
+                            {runningJob === 'for_you' ? <Loader2 className="w-4 h-4 animate-spin"/> : <Play className="w-4 h-4 mr-2"/>} Run Now
                         </Button>
                     </CardContent>
                 </Card>
