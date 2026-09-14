@@ -624,24 +624,49 @@ pub(crate) async fn write_series_json(db: &Db, series_id: &str) -> bool {
     // Mylar-internal structure. This is half of the zero-API restore: series.json says WHICH
     // volumes are attached, the annual files' own ComicInfo says which one each file came from.
     let attachment_rows = sqlx::query(
-        r#"SELECT "metadataSource", "volumeId", kind, name, "startYear" FROM "AttachedVolume" WHERE "seriesId" = $1 ORDER BY "createdAt" ASC"#,
+        r#"SELECT id, "metadataSource", "volumeId", kind, name, "startYear" FROM "AttachedVolume" WHERE "seriesId" = $1 ORDER BY "createdAt" ASC"#,
     )
     .bind(series_id)
     .fetch_all(&db.pool)
     .await
     .unwrap_or_default();
-    let attached_volumes: Vec<serde_json::Value> = attachment_rows
-        .iter()
-        .map(|r| {
-            serde_json::json!({
-                "source": r.try_get::<String, _>("metadataSource").unwrap_or_else(|_| "COMICVINE".to_string()),
-                "volume_id": r.try_get::<String, _>("volumeId").unwrap_or_default(),
-                "kind": r.try_get::<String, _>("kind").unwrap_or_else(|_| "ANNUAL".to_string()),
-                "name": r.try_get::<Option<String>, _>("name").unwrap_or(None),
-                "start_year": r.try_get::<Option<i32>, _>("startYear").unwrap_or(None),
-            })
-        })
-        .collect();
+    let mut attached_volumes: Vec<serde_json::Value> = Vec::with_capacity(attachment_rows.len());
+    for r in &attachment_rows {
+        let attachment_id: String = r.try_get("id").unwrap_or_default();
+        let kind: String = r.try_get::<String, _>("kind").unwrap_or_else(|_| "ANNUAL".to_string());
+        let mut entry = serde_json::json!({
+            "source": r.try_get::<String, _>("metadataSource").unwrap_or_else(|_| "COMICVINE".to_string()),
+            "volume_id": r.try_get::<String, _>("volumeId").unwrap_or_default(),
+            "kind": kind,
+            "name": r.try_get::<Option<String>, _>("name").unwrap_or(None),
+            "start_year": r.try_get::<Option<i32>, _>("startYear").unwrap_or(None),
+        });
+        // #203 COLLECTED coverage: which run issues each book reprints — curation, so it rides in
+        // series.json and comes back with the zero-API restore. Only books that carry it.
+        if kind == "COLLECTED" {
+            let books: Vec<serde_json::Value> = sqlx::query(
+                r#"SELECT "metadataId", number, "coversIssues" FROM "Issue"
+                   WHERE "attachedVolumeId" = $1 AND "coversIssues" IS NOT NULL AND "coversIssues" <> ''
+                     AND "metadataId" IS NOT NULL AND "metadataId" NOT LIKE 'unmatched!_%' ESCAPE '!'
+                   ORDER BY number ASC"#,
+            )
+            .bind(&attachment_id)
+            .fetch_all(&db.pool)
+            .await
+            .unwrap_or_default()
+            .iter()
+            .map(|b| serde_json::json!({
+                "issue_id": b.try_get::<String, _>("metadataId").unwrap_or_default(),
+                "number": b.try_get::<String, _>("number").unwrap_or_default(),
+                "covers": b.try_get::<String, _>("coversIssues").unwrap_or_default(),
+            }))
+            .collect();
+            if !books.is_empty() {
+                entry["books"] = serde_json::Value::Array(books);
+            }
+        }
+        attached_volumes.push(entry);
+    }
 
     // Mylar series.json schema v1.0.2. Unknown values are null, never "": Komga ignores nulls
     // but chokes on blanks. https://github.com/mylar3/mylar3/wiki/series.json-schema-(version-1.0.2)

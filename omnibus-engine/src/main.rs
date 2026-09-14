@@ -19,6 +19,7 @@ mod metadata_cache;
 mod engine_config;
 mod discover;
 mod recommendations;
+mod coverage;
 mod monitor;
 mod download;
 mod log_forward;

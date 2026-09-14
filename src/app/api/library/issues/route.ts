@@ -15,6 +15,7 @@ import { getAuthOptions } from '@/app/api/auth/[...nextauth]/options';
 import { Logger } from '@/lib/logger';
 import { getErrorMessage } from '@/lib/utils/error';
 import { getAccessibleLibraryIds } from '@/lib/library-access';
+import { expandCoverage, isCovered } from '@/lib/utils/coverage';
 
 // Map an era label to a Series.year range (mirrors the series library route).
 function eraToYear(era: string): { gte?: number; lt?: number; gt?: number } | null {
@@ -79,14 +80,46 @@ export async function GET(request: Request) {
                 // Requesting from this view needs what the series page has in hand: the series'
                 // provider identity, and the issue's domain (annual / collected) for the composite.
                 isAnnual: true,
+                seriesId: true,
+                attachedVolumeId: true,
                 attachedVolume: { select: { kind: true, name: true } },
                 series: { select: { name: true, publisher: true, year: true, folderPath: true, metadataId: true, metadataSource: true } }
             }
         });
 
         const hasMore = rows.length > limit;
-        const pageRows = hasMore ? rows.slice(0, limit) : rows;
-        const nextCursor = hasMore ? pageRows[pageRows.length - 1]?.id ?? null : null;
+        const pageRowsAll = hasMore ? rows.slice(0, limit) : rows;
+        const nextCursor = hasMore ? pageRowsAll[pageRowsAll.length - 1]?.id ?? null : null;
+
+        // #203 COLLECTED coverage: a main-run issue nobody has on disk but an OWNED collected book
+        // reprints is not missing — it leaves this list (and so "Request all shown") unless the
+        // caller asks for it with includeCovered=1, in which case it carries `coveredBy`. Coverage
+        // is an expression, so this is a post-filter on the page: a page can come back shorter than
+        // `limit`; the cursor still advances past what was fetched.
+        const includeCovered = searchParams.get('includeCovered') === '1';
+        const coveredBy = new Map<string, { name: string | null; number: string; collectionName: string | null }>();
+        const candidateSeries = Array.from(new Set(
+            pageRowsAll.filter((i: any) => !i.filePath && !i.attachedVolumeId && !i.isAnnual).map((i: any) => i.seriesId as string)
+        ));
+        if (candidateSeries.length > 0) {
+            const books = await prisma.issue.findMany({
+                where: { seriesId: { in: candidateSeries }, filePath: { not: null }, coversIssues: { not: null }, attachedVolume: { kind: 'COLLECTED' } },
+                select: { seriesId: true, number: true, name: true, coversIssues: true, attachedVolume: { select: { name: true } } },
+            });
+            const bySeries = new Map<string, { set: string[]; book: { name: string | null; number: string; collectionName: string | null } }[]>();
+            for (const b of books) {
+                const set = expandCoverage(b.coversIssues);
+                if (set.length === 0) continue;
+                if (!bySeries.has(b.seriesId)) bySeries.set(b.seriesId, []);
+                bySeries.get(b.seriesId)!.push({ set, book: { name: b.name, number: b.number, collectionName: b.attachedVolume?.name ?? null } });
+            }
+            for (const i of pageRowsAll as any[]) {
+                if (i.filePath || i.attachedVolumeId || i.isAnnual) continue;
+                const hit = (bySeries.get(i.seriesId) || []).find(({ set }) => isCovered(i.number, set));
+                if (hit) coveredBy.set(i.id, hit.book);
+            }
+        }
+        const pageRows = includeCovered ? pageRowsAll : pageRowsAll.filter((i: any) => !coveredBy.has(i.id));
 
         const issues = pageRows.map((i: any) => {
             let cover = i.coverUrl;
@@ -117,7 +150,9 @@ export async function GET(request: Request) {
                 collectionName: i.attachedVolume?.kind === 'COLLECTED' ? (i.attachedVolume?.name ?? null) : null,
                 seriesMetadataId,
                 metadataSource: i.series?.metadataSource || 'COMICVINE',
-                requestable
+                requestable,
+                // Only present when includeCovered=1 kept a covered issue on the page.
+                ...(coveredBy.has(i.id) ? { coveredBy: coveredBy.get(i.id) } : {})
             };
         });
 

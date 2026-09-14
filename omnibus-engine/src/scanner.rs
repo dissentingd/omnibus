@@ -266,7 +266,7 @@ fn is_numeric_entity(s: &str) -> bool {
 /// VOLUME id per the Mylar spec — a direct, zero-API series match that works even when the folder's
 /// archives are RAR/CBR (where ComicInfo.xml can't be read pre-conversion).
 #[derive(Debug, Default)]
-struct SeriesJsonInfo {
+pub(crate) struct SeriesJsonInfo {
     comicid: Option<i64>,
     name: Option<String>,
     publisher: Option<String>,
@@ -279,17 +279,20 @@ struct SeriesJsonInfo {
     /// file says WHICH volumes are attached to this series; each annual file's ComicInfo says which
     /// one it came from. Absent in a foreign (Mylar-written) series.json, which is the point of the
     /// namespace.
-    attached_volumes: Vec<AttachedVolumeSeed>,
+    pub(crate) attached_volumes: Vec<AttachedVolumeSeed>,
 }
 
 /// One attachment as recorded in series.json.
 #[derive(Debug, Clone)]
-struct AttachedVolumeSeed {
-    source: String,
-    volume_id: String,
-    kind: String,
-    name: Option<String>,
-    start_year: Option<i32>,
+pub(crate) struct AttachedVolumeSeed {
+    pub(crate) source: String,
+    pub(crate) volume_id: String,
+    pub(crate) kind: String,
+    pub(crate) name: Option<String>,
+    pub(crate) start_year: Option<i32>,
+    /// #203 COLLECTED coverage: (provider issue id, covers) per book that had coverage when the
+    /// file was written — the lane sync restores it onto the recreated book rows with no calls.
+    pub(crate) books: Vec<(String, String)>,
 }
 
 fn parse_series_json(content: &str) -> Option<SeriesJsonInfo> {
@@ -320,12 +323,22 @@ fn parse_series_json(content: &str) -> Option<SeriesJsonInfo> {
                         .and_then(|x| x.as_str().map(str::to_string).or_else(|| x.as_i64().map(|n| n.to_string())))
                         .map(|s| s.trim().to_string())
                         .filter(|s| !s.is_empty())?;
+                    let books = e.get("books").and_then(|b| b.as_array())
+                        .map(|arr| arr.iter().filter_map(|b| {
+                            let id = b.get("issue_id")
+                                .and_then(|x| x.as_str().map(str::to_string).or_else(|| x.as_i64().map(|n| n.to_string())))
+                                .map(|s| s.trim().to_string()).filter(|s| !s.is_empty())?;
+                            let covers = b.get("covers").and_then(|x| x.as_str()).map(str::trim).filter(|s| !s.is_empty())?;
+                            Some((id, covers.to_string()))
+                        }).collect())
+                        .unwrap_or_default();
                     Some(AttachedVolumeSeed {
                         source: e.get("source").and_then(|x| x.as_str()).filter(|s| !s.is_empty()).unwrap_or("COMICVINE").to_string(),
                         volume_id,
                         kind: e.get("kind").and_then(|x| x.as_str()).filter(|s| !s.is_empty()).unwrap_or("ANNUAL").to_string(),
                         name: e.get("name").and_then(|x| x.as_str()).filter(|s| !s.is_empty()).map(str::to_string),
                         start_year: e.get("start_year").and_then(|x| x.as_i64()).map(|y| y as i32).filter(|y| *y != 0),
+                        books,
                     })
                 })
                 .collect()
@@ -345,7 +358,7 @@ fn parse_series_json(content: &str) -> Option<SeriesJsonInfo> {
 
 /// Reads `<folder>/series.json` if present. Any read/parse failure is a None (the scan proceeds on
 /// ComicInfo/folder-name evidence), but a malformed file in a tagged library is worth a log line.
-fn read_series_json(folder: &Path) -> Option<SeriesJsonInfo> {
+pub(crate) fn read_series_json(folder: &Path) -> Option<SeriesJsonInfo> {
     let path = folder.join("series.json");
     let content = std::fs::read_to_string(&path).ok()?;
     let parsed = parse_series_json(&content);

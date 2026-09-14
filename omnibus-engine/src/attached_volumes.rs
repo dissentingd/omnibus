@@ -69,6 +69,9 @@ struct LaneIssue {
 struct LaneVolume {
     name: Option<String>,
     start_year: Option<i32>,
+    /// The provider's own text — for a one-book collected volume it may state "Collects #1-6"
+    /// (coverage prefill, #203 COLLECTED).
+    description: Option<String>,
 }
 
 pub async fn sync_request(db: &Db, payload: AttachSyncRequest) -> anyhow::Result<Vec<AttachSummary>> {
@@ -170,11 +173,31 @@ async fn sync_attachment(db: &Db, client: &Client, attachment_id: &str, claim: b
     // The name-anchoring rule needs the parent's name and every attachment's name on this series.
     // THIS attachment takes the provider's fresh name (its DB name is still empty on the very first
     // sync); the others keep what earlier syncs stored.
-    let series_name: String = sqlx::query_scalar(r#"SELECT name FROM "Series" WHERE id = $1"#)
+    let (series_name, series_folder): (String, String) = sqlx::query(r#"SELECT name, "folderPath" FROM "Series" WHERE id = $1"#)
         .bind(&series_id)
         .fetch_optional(&db.pool)
         .await?
+        .map(|r| (r.try_get("name").unwrap_or_default(), r.try_get("folderPath").unwrap_or_default()))
         .unwrap_or_default();
+
+    // #203 COLLECTED coverage: what series.json remembered per book of THIS volume (a restore
+    // after a wipe recreates the book rows here, and their coverage must come back with no calls).
+    let series_json_books: std::collections::HashMap<String, String> = if kind == "COLLECTED" && !series_folder.is_empty() {
+        let folder = series_folder.clone();
+        let (src, vid) = (source.clone(), volume_id.clone());
+        tokio::task::spawn_blocking(move || crate::scanner::read_series_json(std::path::Path::new(&folder)))
+            .await
+            .ok()
+            .flatten()
+            .map(|sj| sj.attached_volumes.into_iter()
+                .filter(|a| a.source == src && a.volume_id == vid)
+                .flat_map(|a| a.books)
+                .collect())
+            .unwrap_or_default()
+    } else {
+        std::collections::HashMap::new()
+    };
+    let single_book_volume = issues.len() == 1;
     let name_refs: Vec<AttachmentNameRef> = sqlx::query(r#"SELECT id, name, kind FROM "AttachedVolume" WHERE "seriesId" = $1"#)
         .bind(&series_id)
         .fetch_all(&db.pool)
@@ -196,7 +219,7 @@ async fn sync_attachment(db: &Db, client: &Client, attachment_id: &str, claim: b
                       CAST("hasCustomMetadata" AS INTEGER) AS "hasCustomMetadata",
                       CAST("hasCustomCover" AS INTEGER) AS "hasCustomCover",
                       writers, artists, "coverArtists", colorists, letterers, characters, teams, locations,
-                      inker, editor, translator
+                      inker, editor, translator, "coversIssues"
                FROM "Issue" WHERE "attachedVolumeId" = $1 AND "metadataId" = $2"#,
         )
         .bind(attachment_id)
@@ -269,16 +292,30 @@ async fn sync_attachment(db: &Db, client: &Client, attachment_id: &str, claim: b
         let editor_val = merge_credit_json(col("editor"), &c.editors, locked, file_priority);
         let translator_val = merge_credit_json(col("translator"), &c.translators, locked, file_priority);
 
+        // #203 COLLECTED coverage prefill — fill-blank ONLY, from series.json (a restore), else the
+        // book's own "Collects #1-6", else a one-book volume's text. A value already there is the
+        // user's and is never touched; annual lanes never carry coverage.
+        let covers_fill: Option<String> = crate::coverage::coverage_fill_for(
+            &kind,
+            target.and_then(|r| r.try_get::<Option<String>, _>("coversIssues").unwrap_or(None)).as_deref(),
+            series_json_books.get(&issue.source_id).map(|s| s.as_str()),
+            issue.description.as_deref(),
+            volume.description.as_deref(),
+            single_book_volume,
+        );
+
         let res = if let Some(t) = target {
             let row_id: String = t.get("id");
             // `number` is ABSENT from this UPDATE on purpose: inside an attached lane the number is
             // the user's curation, and the id is the anchor. A claim additionally stamps the link.
+            // coversIssues is fill-blank: COALESCE over the existing value (blank = empty).
             sqlx::query(&format!(
                 r#"UPDATE "Issue" SET "attachedVolumeId"=$1, "metadataId"=$2, "metadataSource"=$3, "isAnnual"={annual},
                    name=$4, description=$5, "releaseDate"=$6, "coverUrl"=$7, "matchState"=$8,
                    writers=$9, artists=$10, "coverArtists"=$11, colorists=$12, letterers=$13,
-                   characters=$14, teams=$15, locations=$16, inker=$17, editor=$18, translator=$19
-                   WHERE id=$20"#,
+                   characters=$14, teams=$15, locations=$16, inker=$17, editor=$18, translator=$19,
+                   "coversIssues"=COALESCE(NULLIF("coversIssues", ''), $20)
+                   WHERE id=$21"#,
                 annual = annual_lit
             ))
             .bind(attachment_id)
@@ -300,6 +337,7 @@ async fn sync_attachment(db: &Db, client: &Client, attachment_id: &str, claim: b
             .bind(&inker_val)
             .bind(&editor_val)
             .bind(&translator_val)
+            .bind(&covers_fill)
             .bind(&row_id)
             .execute(&db.pool)
             .await
@@ -313,8 +351,8 @@ async fn sync_attachment(db: &Db, client: &Client, attachment_id: &str, claim: b
                    (id, "seriesId", "attachedVolumeId", "metadataId", "metadataSource", number, "isAnnual", status,
                     name, description, "releaseDate", "coverUrl", "matchState",
                     writers, artists, "coverArtists", colorists, letterers, characters, teams, locations,
-                    inker, editor, translator, "createdAt", "updatedAt")
-                   VALUES ($1,$2,$3,$4,$5,$6,{annual},'WANTED',$7,$8,$9,$10,'MATCHED',$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,{now},{now})"#,
+                    inker, editor, translator, "coversIssues", "createdAt", "updatedAt")
+                   VALUES ($1,$2,$3,$4,$5,$6,{annual},'WANTED',$7,$8,$9,$10,'MATCHED',$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,{now},{now})"#,
                 annual = annual_lit,
                 now = db.now_expr()
             ))
@@ -339,6 +377,7 @@ async fn sync_attachment(db: &Db, client: &Client, attachment_id: &str, claim: b
             .bind(&inker_val)
             .bind(&editor_val)
             .bind(&translator_val)
+            .bind(&covers_fill)
             .execute(&db.pool)
             .await
         };
@@ -411,7 +450,7 @@ async fn find_unbound_by_id(
                   CAST("hasCustomMetadata" AS INTEGER) AS "hasCustomMetadata",
                   CAST("hasCustomCover" AS INTEGER) AS "hasCustomCover",
                   writers, artists, "coverArtists", colorists, letterers, characters, teams, locations,
-                  inker, editor, translator
+                  inker, editor, translator, "coversIssues"
            FROM "Issue"
            WHERE "seriesId" = $1 AND "isAnnual" = true AND "attachedVolumeId" IS NULL
              AND "metadataId" = $2 AND "metadataSource" = $3"#,
@@ -432,7 +471,7 @@ async fn find_claim_candidate(db: &Db, series_id: &str, number: &str) -> anyhow:
                   CAST("hasCustomMetadata" AS INTEGER) AS "hasCustomMetadata",
                   CAST("hasCustomCover" AS INTEGER) AS "hasCustomCover",
                   writers, artists, "coverArtists", colorists, letterers, characters, teams, locations,
-                  inker, editor, translator
+                  inker, editor, translator, "coversIssues"
            FROM "Issue"
            WHERE "seriesId" = $1 AND "isAnnual" = true AND "attachedVolumeId" IS NULL AND "filePath" IS NOT NULL"#,
     )
@@ -514,7 +553,7 @@ async fn find_claim_candidate_by_name(
                   CAST("hasCustomMetadata" AS INTEGER) AS "hasCustomMetadata",
                   CAST("hasCustomCover" AS INTEGER) AS "hasCustomCover",
                   writers, artists, "coverArtists", colorists, letterers, characters, teams, locations,
-                  inker, editor, translator, "filePath"
+                  inker, editor, translator, "filePath", "coversIssues"
            FROM "Issue"
            WHERE "seriesId" = $1 AND "attachedVolumeId" IS NULL AND "filePath" IS NOT NULL AND "filePath" <> ''"#,
     )
@@ -551,7 +590,7 @@ async fn fetch_comicvine_lane(db: &Db, client: &Client, volume_id: &str) -> anyh
     let vol_url = format!("https://comicvine.gamespot.com/api/volume/4050-{}/", volume_id);
     let vol_req = client
         .get(&vol_url)
-        .query(&[("api_key", api_key.as_str()), ("format", "json"), ("field_list", "name,start_year,count_of_issues")])
+        .query(&[("api_key", api_key.as_str()), ("format", "json"), ("field_list", "name,start_year,count_of_issues,description,deck")])
         .header("User-Agent", "Omnibus/1.0")
         .timeout(Duration::from_secs(15))
         .build()?;
@@ -572,6 +611,10 @@ async fn fetch_comicvine_lane(db: &Db, client: &Client, volume_id: &str) -> anyh
     volume.name = vol_json["results"]["name"].as_str().filter(|s| !s.is_empty()).map(|s| s.to_string());
     volume.start_year = vol_json["results"]["start_year"].as_str().and_then(|s| s.trim().parse::<i32>().ok())
         .or_else(|| vol_json["results"]["start_year"].as_i64().map(|v| v as i32));
+    volume.description = vol_json["results"]["description"].as_str()
+        .or_else(|| vol_json["results"]["deck"].as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
 
     let mut issues = Vec::new();
     let mut offset = 0i32;
@@ -654,6 +697,7 @@ async fn fetch_metron_lane(db: &Db, client: &Client, volume_id: &str) -> anyhow:
     let volume = LaneVolume {
         name: data["series"].as_str().or_else(|| data["name"].as_str()).filter(|s| !s.is_empty()).map(|s| s.to_string()),
         start_year: data["year_began"].as_i64().map(|y| y as i32).filter(|y| *y != 0),
+        description: data["desc"].as_str().filter(|s| !s.is_empty()).map(|s| s.to_string()),
     };
 
     let mut raw: Vec<serde_json::Value> = Vec::new();

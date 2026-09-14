@@ -12,6 +12,7 @@ import { getErrorMessage } from '@/lib/utils/error';
 import { AuditLogger } from '@/lib/audit-logger';
 import { describeIssueFromFilename, normalizeFractionNumbers } from '@/lib/utils/issue-parser';
 import { attachmentForFilename } from '@/lib/utils/attachment-name';
+import { expandCoverage, isCovered } from '@/lib/utils/coverage';
 import { COMIC_EXT_REGEX } from '@/lib/utils/formats';
 import { sanitizeDescription, providerWikiBase } from '@/lib/utils/sanitize';
 import { safeParse } from '@/lib/utils/safe-parse';
@@ -333,6 +334,8 @@ export async function GET(request: Request) {
                 attachedVolumeId: (issue as any).attachedVolumeId ?? null,
                 isCollected,
                 collectionName: isCollected ? (issue as any).attachedVolume?.name ?? null : null,
+                // #203 COLLECTED coverage: which run issues this book reprints ("1-6, 8"), books only.
+                coversIssues: isCollected ? ((issue as any).coversIssues ?? null) : null,
                 // Issue #200: normalize vulgar fractions ("½" → 0.5) or parseFloat yields NaN,
                 // which serializes to null and turned half-issue requests into "#null" searches.
                 // The raw number rides along so the page can always fall back to a real string.
@@ -360,11 +363,36 @@ export async function GET(request: Request) {
         }
     }
 
+    // #203 COLLECTED coverage (field report by robotshavehearts2): an OWNED collected book that
+    // says which run issues it reprints takes those issues out of "missing" — you have the story,
+    // just not the single. They move to `coveredIssues`, each naming the book that covers it, so a
+    // page can still show them (and a request can still be made deliberately). Coverage names
+    // main-run numbers only; annuals are never covered by it.
+    const coveredIssues: any[] = [];
+    const coveringBooks = collectedEditions
+        .filter(b => typeof b.coversIssues === 'string' && b.coversIssues.trim())
+        .map(b => ({ book: b, set: expandCoverage(b.coversIssues) }))
+        .filter(({ set }) => set.length > 0);
+    if (coveringBooks.length > 0 && missingIssues.length > 0) {
+        const stillMissing: any[] = [];
+        for (const m of missingIssues) {
+            const hit = m.isAnnual ? undefined : coveringBooks.find(({ set }) => isCovered(m.number, set));
+            if (hit) {
+                coveredIssues.push({ ...m, coveredBy: { id: hit.book.id, number: hit.book.number, name: hit.book.name, collectionName: hit.book.collectionName } });
+            } else {
+                stillMissing.push(m);
+            }
+        }
+        missingIssues.length = 0;
+        missingIssues.push(...stillMissing);
+    }
+
     // #203: annuals read AFTER the main run (Mylar-style), then by number within each domain.
     const domainThenNumber = (a: any, b: any) =>
         ((a.isAnnual ? 1 : 0) - (b.isAnnual ? 1 : 0)) || ((a.parsedNum ?? 0) - (b.parsedNum ?? 0));
     downloadedIssues.sort(domainThenNumber);
     missingIssues.sort(domainThenNumber);
+    coveredIssues.sort(domainThenNumber);
     // Collections read in the order the user numbered them — that curation IS the reading order.
     const byNumber = (a: any, b: any) => (a.parsedNum ?? 0) - (b.parsedNum ?? 0);
     collectedEditions.sort(byNumber);
@@ -439,6 +467,7 @@ export async function GET(request: Request) {
       },
       downloadedIssues,
       missingIssues,
+      coveredIssues,
       collectedEditions,
       missingCollectedEditions,
       duplicates: duplicatesList

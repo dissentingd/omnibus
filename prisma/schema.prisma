@@ -279,6 +279,11 @@ model Issue {
   alternateNumber String?  // ComicInfo <AlternateNumber>
   alternateCount  Int?     // ComicInfo <AlternateCount>
   storyArcNumber  String?  // ComicInfo <StoryArcNumber>
+  // #203 COLLECTED coverage (field report by robotshavehearts2): which MAIN-RUN issue numbers this
+  // collected book reprints — "1-6, 8". Meaningful only on a book of a COLLECTED attachment. An owned
+  // book's coverage takes those issues out of "missing". Curation: prefilled from the provider's
+  // "Collects #1-6" text once, never overwritten by a sync, carried in series.json for restore.
+  coversIssues    String?
   gtin            String?  // ComicInfo <GTIN> (ISBN/ISSN/EAN — per-file by nature)
   notes           String?  // ComicInfo <Notes> (per-file tagger provenance survives embeds now)
   scanInformation String?  // ComicInfo <ScanInformation>

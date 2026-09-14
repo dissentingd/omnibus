@@ -16,6 +16,7 @@ import { omnibusQueue } from '@/lib/queue';
 import { getAccessibleLibraryIds, canAccessLibraryId } from '@/lib/library-access';
 import { cachedCvGet } from '@/lib/metadata/metadata-cache';
 import { issueIdentityMismatch } from '@/lib/metadata/issue-identity';
+import { normalizeCoverage } from '@/lib/utils/coverage';
 
 export async function GET(request: Request) {
   const { searchParams } = new URL(request.url);
@@ -337,6 +338,33 @@ export async function PATCH(request: Request) {
             });
             await AuditLogger.log('RESTORE_ISSUE_DEFAULTS', { issueId, issueName, scope: 'single' }, (session.user as any).id);
             return NextResponse.json({ success: true, unlocked: true });
+        }
+
+        // #203 COLLECTED coverage: which run issues a collected book reprints ("1-6, 8"). Curation
+        // of its own kind — validated to the canonical form, no narrative lock, no ComicInfo embed
+        // (the schema has no tag for it), and only meaningful on a book of a COLLECTED attachment.
+        let coverageChanged = false;
+        if (body.coversIssues !== undefined) {
+            const raw = body.coversIssues === null ? '' : String(body.coversIssues);
+            const normalized = raw.trim() === '' ? null : normalizeCoverage(raw);
+            if (raw.trim() !== '' && normalized === null) {
+                return NextResponse.json({ error: 'Coverage must be issue numbers or ranges, like "1-6, 8".' }, { status: 400 });
+            }
+            const attachment = (existing as any).attachedVolumeId
+                ? await prisma.attachedVolume.findUnique({ where: { id: (existing as any).attachedVolumeId }, select: { kind: true } })
+                : null;
+            if (normalized !== null && attachment?.kind !== 'COLLECTED') {
+                return NextResponse.json({ error: 'Only a collected edition can cover issues.' }, { status: 400 });
+            }
+            if (normalized !== ((existing as any).coversIssues ?? null)) {
+                await prisma.issue.update({ where: { id: issueId }, data: { coversIssues: normalized } });
+                await AuditLogger.log('UPDATE_ISSUE_COVERAGE', { issueId, issueName, coversIssues: normalized }, (session.user as any).id);
+                coverageChanged = true;
+            }
+            const otherKeys = Object.keys(body).filter(k => k !== 'issueId' && k !== 'coversIssues');
+            if (otherKeys.length === 0) {
+                return NextResponse.json({ success: true, changed: coverageChanged, wroteToFile: false, coversIssues: normalized });
+            }
         }
 
         // Multi-value fields arrive from the editor as arrays; persisted as JSON strings.
