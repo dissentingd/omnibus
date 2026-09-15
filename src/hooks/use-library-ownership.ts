@@ -4,6 +4,9 @@ export type StatusType =
   | 'LIBRARY_MONITORED'
   | 'LIBRARY_UNMONITORED'
   | 'ISSUE_OWNED'
+  // #203 COLLECTED coverage: not on disk, but reprinted in a collected edition that is. Neither
+  // "In Library" nor something a volume's "Request Missing" asks for; its own Request stays.
+  | 'ISSUE_COVERED'
   | 'REQUESTED'
   | 'PENDING_APPROVAL'
   | 'UNRELEASED'
@@ -25,6 +28,7 @@ export function useLibraryOwnership(refreshSignal: unknown = 0) {
   const [ownedSeries, setOwnedSeries] = useState<Set<string>>(new Set());
   const [monitoredSeries, setMonitoredSeries] = useState<Set<string>>(new Set());
   const [ownedIssues, setOwnedIssues] = useState<Set<string>>(new Set());
+  const [coveredIssues, setCoveredIssues] = useState<Set<string>>(new Set());
   const [activeRequests, setActiveRequests] = useState<any[]>([]);
   const [requestedVolumes, setRequestedVolumes] = useState<Set<string>>(new Set());
   const [requestedIssues, setRequestedIssues] = useState<Set<string>>(new Set());
@@ -37,6 +41,7 @@ export function useLibraryOwnership(refreshSignal: unknown = 0) {
           setOwnedSeries(new Set((data.series || []).map(String)));
           setMonitoredSeries(new Set((data.monitored || []).map(String)));
           setOwnedIssues(new Set((data.issues || []).map(String)));
+          setCoveredIssues(new Set((data.covered || []).map(String)));
           setActiveRequests(data.requests || []);
         }
       })
@@ -96,9 +101,11 @@ export function useLibraryOwnership(refreshSignal: unknown = 0) {
       return 'REQUESTED';
     }
 
+    // A request in flight for it wins above (the deliberate ask); otherwise it is covered.
+    if (coveredIssues.has(idStr)) return 'ISSUE_COVERED';
     if (isReleased === false) return 'UNRELEASED';
     return null;
-  }, [ownedIssues, requestedIssues, activeRequests]);
+  }, [ownedIssues, coveredIssues, requestedIssues, activeRequests]);
 
   return {
     getVolumeStatus,

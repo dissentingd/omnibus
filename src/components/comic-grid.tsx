@@ -310,6 +310,8 @@ export function ComicGrid({ title, type, refreshSignal = 0 }: Props) {
                 {volStatus === 'PENDING_APPROVAL' && (<div className="absolute top-2 right-2 bg-yellow-500 text-white rounded-full p-1 z-10 shadow-md" title="Pending Admin Approval"><Clock className="w-4 h-4 sm:w-3 sm:h-3" /></div>)}
 
                 {issueStatus === 'ISSUE_OWNED' && (<div className="absolute top-2 left-2 bg-emerald-500 text-white rounded-full p-1 shadow-lg z-30" title="In Library"><FileCheck className="w-4 h-4 sm:w-3 sm:h-3" /></div>)}
+                {/* #203 COLLECTED coverage: reprinted in a trade you own — not "In Library", not missing. */}
+                {issueStatus === 'ISSUE_COVERED' && (<div className="absolute top-2 left-2 bg-emerald-700 text-white rounded-full p-1 shadow-lg z-30" title="In a collection you own"><BookMarked className="w-4 h-4 sm:w-3 sm:h-3" /></div>)}
                 {issueStatus === 'REQUESTED' && (<div className="absolute top-2 left-2 bg-orange-500 text-white rounded-full p-1 shadow-lg z-30" title="Requested"><Clock className="w-4 h-4 sm:w-3 sm:h-3" /></div>)}
                 {issueStatus === 'PENDING_APPROVAL' && (<div className="absolute top-2 left-2 bg-yellow-500 text-white rounded-full p-1 shadow-lg z-30" title="Pending Admin Approval"><Clock className="w-4 h-4 sm:w-3 sm:h-3" /></div>)}
                 {issueStatus === 'UNRELEASED' && (<div className="absolute top-2 left-2 bg-purple-500 text-white rounded-full p-1 shadow-lg z-30" title="Unreleased"><Clock className="w-4 h-4 sm:w-3 sm:h-3" /></div>)}
@@ -368,7 +370,8 @@ export function ComicGrid({ title, type, refreshSignal = 0 }: Props) {
                               const missingAvailableIssues = relatedIssues.filter(issue => {
                                   const relIssueStatus = getIssueStatus(issue.id, selectedComic.volumeId, issue.name, issue.isReleased, issue.issueNumber, seriesBaseName);
                                   const isReleased = issue.isReleased !== false; 
-                                  return isReleased && relIssueStatus !== 'ISSUE_OWNED';
+                                  // #203 COLLECTED coverage: reprinted in an owned trade is not missing either.
+                                  return isReleased && relIssueStatus !== 'ISSUE_OWNED' && relIssueStatus !== 'ISSUE_COVERED';
                               });
                               const isAllAvailableOwned = isVolOwned && relatedIssues.length > 0 && missingAvailableIssues.length === 0;
 
@@ -613,6 +616,7 @@ export function ComicGrid({ title, type, refreshSignal = 0 }: Props) {
                                                     {relIssueStatus === 'REQUESTED' && (<div className="absolute top-1 left-1 bg-orange-500 text-white rounded-md px-1 py-0.5 text-[8px] font-bold z-20">REQUESTED</div>)}
                                                     {relIssueStatus === 'PENDING_APPROVAL' && (<div className="absolute top-1 left-1 bg-yellow-500 text-white rounded-md px-1 py-0.5 text-[8px] font-bold z-20" title="Pending Admin Approval">PENDING</div>)}
                                                     {relIssueStatus === 'ISSUE_OWNED' && (<div className="absolute top-1 left-1 bg-emerald-500 text-white rounded-md px-1 py-0.5 text-[8px] font-bold z-20">IN LIBRARY</div>)}
+                                                    {relIssueStatus === 'ISSUE_COVERED' && (<div className="absolute top-1 left-1 bg-emerald-700 text-white rounded-md px-1 py-0.5 text-[8px] font-bold z-20" title="In a collection you own">COVERED</div>)}
                                                     {relIssueStatus === 'UNRELEASED' && (<div className="absolute top-1 left-1 bg-purple-500 text-white rounded-md px-1 py-0.5 text-[8px] font-bold z-20">UNRELEASED</div>)}
                                                     {(!relIssueStatus && issue.isReleased === false) && (<div className="absolute top-1 left-1 bg-purple-500/80 text-white rounded-md px-1 py-0.5 text-[8px] font-bold z-20">UNRELEASED</div>)}
                                                 </div>

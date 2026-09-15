@@ -56,9 +56,9 @@ fn canonical_token(raw: &str) -> Option<(String, Option<(i64, i64)>)> {
 /// comma- or semicolon-separated; "a-b" (a ≤ b, span ≤ MAX_RANGE_SPAN) or a single number ("8",
 /// "12a", "½" → "0.5", "001" → "1"). Anything else is skipped, never guessed.
 ///
-/// The engine only prefills and carries coverage; the missing-issue math lives in Node. This twin
-/// exists so the two sides can never read an expression differently, and for its mirrored tests.
-#[allow(dead_code)]
+/// The missing-issue math lives in Node; the engine's monitor reads the same expressions to keep a
+/// covered issue out of its automatic requests (`monitor::load_state`). This twin exists so the two
+/// sides can never read an expression differently, and for its mirrored tests.
 pub(crate) fn expand_coverage(expr: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for raw in expr.split([',', ';']) {
@@ -91,8 +91,7 @@ pub(crate) fn normalize_coverage(expr: &str) -> Option<String> {
 }
 
 /// Whether `number` is one of the expanded coverage numbers (½ and 0.5 agree, 001 and 1 agree).
-/// Twin of Node's `isCovered` — see `expand_coverage` for why it lives here unused.
-#[allow(dead_code)]
+/// Twin of Node's `isCovered`; the monitor's candidate check is its caller.
 pub(crate) fn is_covered(number: &str, expanded: &[String]) -> bool {
     if number.is_empty() { return false; }
     expanded.iter().any(|t| crate::metadata::is_same_issue(t, number))

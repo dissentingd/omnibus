@@ -36,6 +36,7 @@ describe('Component: ComicGrid', () => {
                         series: [],
                         monitored: [],
                         issues: [100], // Mock Issue ID 100 as owned
+                        covered: [102], // #203 COLLECTED coverage: 102 is reprinted in an owned trade
                         requests: [
                             { volumeId: 200, name: 'Spider-Man #1', status: 'PENDING' }
                         ]
@@ -78,6 +79,19 @@ describe('Component: ComicGrid', () => {
             expect(screen.getAllByTitle('In Library')[0]).toBeInTheDocument();
             expect(screen.getAllByTitle('Requested')[0]).toBeInTheDocument();
         });
+    });
+
+    // #203 COLLECTED coverage: an issue reprinted in an owned trade is neither "In Library" nor
+    // something to bulk-request — it wears its own badge.
+    it('badges an issue an owned collected edition covers as covered, not as in the library', async () => {
+        render(<ComicGrid title="New Releases" type="new" />);
+        await waitFor(() => expect(screen.getByAltText('Superman #1')).toBeInTheDocument());
+
+        await waitFor(() => {
+            expect(screen.getAllByTitle('In a collection you own')[0]).toBeInTheDocument();
+        });
+        // Exactly one card is "In Library" (Batman); Superman is covered, not owned.
+        expect(screen.getAllByTitle('In Library')).toHaveLength(1);
     });
 
     it('should fire a POST request to /api/request when the Request button is clicked in the modal', async () => {

@@ -8,6 +8,8 @@ import { getErrorMessage } from '@/lib/utils/error';
 import { getServerSession } from 'next-auth/next';
 import { getAuthOptions } from '@/app/api/auth/[...nextauth]/options';
 import { getAccessibleLibraryIds, seriesAccessWhere, nestedSeriesAccessWhere } from '@/lib/library-access';
+import { ownedCoverageBySeries } from '@/lib/coverage-ownership';
+import { isCovered } from '@/lib/utils/coverage';
 
 const globalForCache = globalThis as unknown as {
     libraryIdsCache: any;
@@ -41,6 +43,27 @@ export async function GET() {
         })
     ]);
 
+    // #203 COLLECTED coverage: a run issue nobody has on disk but an OWNED collected edition
+    // reprints is not missing. Its provider id rides in a list of its own — Discover and the
+    // request search badge it as covered, and a volume's "Request Missing" leaves it alone — never
+    // among the owned ids (it is not "In Library"). Two extra lookups, only when something covers.
+    const coverage = await ownedCoverageBySeries(nestedSeriesAccessWhere(accessibleLibs));
+    let covered: string[] = [];
+    if (coverage.size > 0) {
+        const candidates = await prisma.issue.findMany({
+            where: {
+                seriesId: { in: Array.from(coverage.keys()) },
+                filePath: null, attachedVolumeId: null, isAnnual: false, metadataId: { not: null },
+                ...nestedSeriesAccessWhere(accessibleLibs),
+            },
+            select: { seriesId: true, number: true, cvId: true, metadataId: true },
+        });
+        covered = candidates
+            .filter(i => isCovered(i.number, coverage.get(i.seriesId) || []))
+            .map(i => String(i.cvId || i.metadataId))
+            .filter(Boolean);
+    }
+
     // Construct the fallback arrays
     const seriesNamesFallback = series.map(s => s.name).filter(Boolean);
     const issueNamesFallback = issues.map(i => {
@@ -56,7 +79,8 @@ export async function GET() {
         series: series.map(s => s.cvId || s.metadataId).filter(Boolean),
         monitored: series.filter(s => s.monitored).map(s => s.cvId || s.metadataId).filter(Boolean),
         issues: issues.map(i => i.cvId || i.metadataId).filter(Boolean),
-        
+        covered,
+
         // --- Cross-Provider Name Fallbacks with Number Normalization ---
         seriesNames: seriesNamesFallback,
         monitoredNames: series.filter(s => s.monitored).map(s => s.name).filter(Boolean),
@@ -78,8 +102,8 @@ export async function GET() {
   } catch (error) {
     Logger.log(`Library IDs API Error: ${getErrorMessage(error)}`, 'error');
     return NextResponse.json({ 
-        series: [], monitored: [], issues: [], 
-        seriesNames: [], monitoredNames: [], issueNames: [], 
+        series: [], monitored: [], issues: [], covered: [],
+        seriesNames: [], monitoredNames: [], issueNames: [],
         requests: [] 
     }); 
   }

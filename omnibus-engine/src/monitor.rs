@@ -103,8 +103,9 @@ async fn update_skeleton_release_date(db: &Db, issue_id: &str, release_date: &st
         .bind(release_date).bind(issue_id).execute(&db.pool).await;
 }
 
-/// Loads every Series + its issues into memory (parity with `findMany({ include: { issues } })`).
-async fn load_state(db: &Db) -> Result<(Vec<SeriesRec>, HashMap<String, Vec<IssueRec>>)> {
+/// Loads every Series + its issues into memory (parity with `findMany({ include: { issues } })`),
+/// plus, per series, the run numbers its OWNED collected editions cover (#203 COLLECTED coverage).
+async fn load_state(db: &Db) -> Result<(Vec<SeriesRec>, HashMap<String, Vec<IssueRec>>, HashMap<String, Vec<String>>)> {
     let series_rows = sqlx::query(
         // Bool columns are CAST for the Any driver (no SQLite BOOLEAN mapping); nullable monitored
         // is COALESCEd in SQL — the code always treated NULL as false.
@@ -124,8 +125,9 @@ async fn load_state(db: &Db) -> Result<(Vec<SeriesRec>, HashMap<String, Vec<Issu
 
     // #203: annual rows are invisible to the monitor — its candidates come from the PARENT
     // provider volume, so an owned "Annual #1" must never satisfy an is_already_in_library
-    // check for the regular #1 (nor pair with provider skeletons by number).
-    let issue_rows = sqlx::query(r#"SELECT id, "seriesId", number, "filePath", "releaseDate" FROM "Issue" WHERE "isAnnual" = false"#).fetch_all(&db.pool).await?;
+    // check for the regular #1 (nor pair with provider skeletons by number). The same holds for
+    // every ATTACHED lane row: an owned trade numbered "3" is not issue #3 (#203 COLLECTED).
+    let issue_rows = sqlx::query(r#"SELECT id, "seriesId", number, "filePath", "releaseDate" FROM "Issue" WHERE "isAnnual" = false AND "attachedVolumeId" IS NULL"#).fetch_all(&db.pool).await?;
     let mut issues: HashMap<String, Vec<IssueRec>> = HashMap::new();
     for r in &issue_rows {
         let sid: String = r.get("seriesId");
@@ -136,11 +138,37 @@ async fn load_state(db: &Db) -> Result<(Vec<SeriesRec>, HashMap<String, Vec<Issu
             release_date: r.get("releaseDate"),
         });
     }
-    Ok((series, issues))
+
+    // #203 COLLECTED coverage: which run numbers each series' OWNED collected books reprint. An
+    // issue in that set is not a candidate — you have the story — though its skeleton still
+    // lives (that row is what the series page's coverage math reads).
+    let coverage_rows = sqlx::query(
+        r#"SELECT i."seriesId", i."coversIssues" FROM "Issue" i
+           JOIN "AttachedVolume" a ON a.id = i."attachedVolumeId"
+           WHERE a.kind = 'COLLECTED' AND i."filePath" IS NOT NULL AND i."filePath" <> ''
+             AND i."coversIssues" IS NOT NULL AND i."coversIssues" <> ''"#,
+    ).fetch_all(&db.pool).await?;
+    let mut coverage: HashMap<String, Vec<String>> = HashMap::new();
+    for r in &coverage_rows {
+        let sid: String = r.get("seriesId");
+        let expr: String = r.get("coversIssues");
+        let list = coverage.entry(sid).or_default();
+        for n in crate::coverage::expand_coverage(&expr) {
+            if !list.contains(&n) { list.push(n); }
+        }
+    }
+    coverage.retain(|_, v| !v.is_empty());
+    Ok((series, issues, coverage))
 }
 
 fn is_already_in_library(issues: &[IssueRec], num: &str) -> bool {
     issues.iter().any(|i| is_same_issue(&i.number, num) && i.file_path.as_deref().map(|p| !p.is_empty()).unwrap_or(false))
+}
+
+/// #203 COLLECTED coverage: on disk as a single, OR reprinted in a collected edition that is —
+/// either way not something the monitor should ask for. Coverage comes from `load_state`.
+fn in_library_or_covered(issues: &[IssueRec], covered: Option<&Vec<String>>, num: &str) -> bool {
+    is_already_in_library(issues, num) || covered.is_some_and(|c| crate::coverage::is_covered(num, c))
 }
 
 /// Phase 1 — Metron Oracle: paginate global upcoming issues, match to local series, upsert skeletons,
@@ -148,7 +176,7 @@ fn is_already_in_library(issues: &[IssueRec], num: &str) -> bool {
 #[allow(clippy::too_many_arguments)]
 async fn phase1_metron(
     db: &Db, client: &Client, user: &str, pass: &str,
-    series: &[SeriesRec], issues: &mut HashMap<String, Vec<IssueRec>>,
+    series: &[SeriesRec], issues: &mut HashMap<String, Vec<IssueRec>>, coverage: &HashMap<String, Vec<String>>,
     skeletons_created: &mut i32, candidates: &mut Vec<MonitorCandidate>, notes: &mut Vec<String>,
 ) {
     use chrono::{Duration, Utc};
@@ -273,8 +301,8 @@ async fn phase1_metron(
             }
         }
 
-        // Candidate emission (monitored + not already in library).
-        if s.monitored && !is_already_in_library(bucket, &m_num_str) {
+        // Candidate emission (monitored + not already in library, nor covered by an owned trade).
+        if s.monitored && !in_library_or_covered(bucket, coverage.get(&s.id), &m_num_str) {
             let issue_year = issue_date.as_deref().and_then(|d| d.split('-').next()).filter(|y| !y.is_empty())
                 .map(|y| y.to_string()).unwrap_or_else(|| s.year.to_string());
             let image_url = m.get("image").and_then(|v| v.as_str()).map(|s| s.to_string()).or_else(|| s.cover_url.clone());
@@ -298,7 +326,7 @@ async fn phase1_metron(
 /// skeletons for not-in-library issues, emit candidates, and bump the series' updatedAt (rotates the window).
 async fn phase2_comicvine(
     db: &Db, client: &Client, cv_api_key: &str,
-    issues: &mut HashMap<String, Vec<IssueRec>>,
+    issues: &mut HashMap<String, Vec<IssueRec>>, coverage: &HashMap<String, Vec<String>>,
     skeletons_created: &mut i32, candidates: &mut Vec<MonitorCandidate>,
 ) -> Result<()> {
     let rows = sqlx::query(
@@ -399,7 +427,8 @@ async fn phase2_comicvine(
                 }
             }
 
-            if already_in_library { continue; }
+            // The skeleton above is kept either way; only the CANDIDATE is withheld for a covered issue.
+            if in_library_or_covered(bucket, coverage.get(&series_id), &cv_num_str) { continue; }
 
             let issue_year = issue_date.as_deref().and_then(|d| d.split('-').next()).filter(|y| !y.is_empty())
                 .map(|y| y.to_string()).unwrap_or_else(|| year.to_string());
@@ -426,7 +455,7 @@ async fn phase2_comicvine(
 }
 
 pub async fn run_series_monitor(db: Db) -> Result<MonitorOutput> {
-    let (series, mut issues) = load_state(&db).await?;
+    let (series, mut issues, coverage) = load_state(&db).await?;
     let client = Client::builder().build()?;
 
     let mut skeletons_created = 0;
@@ -444,7 +473,7 @@ pub async fn run_series_monitor(db: Db) -> Result<MonitorOutput> {
     }
     let metron_pass = crate::secret_crypto::decrypt_setting(&db.pool, Some(metron_pass)).await.unwrap_or_default();
     if !metron_user.is_empty() && !metron_pass.is_empty() {
-        phase1_metron(&db, &client, &metron_user, &metron_pass, &series, &mut issues, &mut skeletons_created, &mut candidates, &mut notes).await;
+        phase1_metron(&db, &client, &metron_user, &metron_pass, &series, &mut issues, &coverage, &mut skeletons_created, &mut candidates, &mut notes).await;
     }
 
     // Phase 2 — ComicVine (only when a key is present).
@@ -452,7 +481,7 @@ pub async fn run_series_monitor(db: Db) -> Result<MonitorOutput> {
         .fetch_optional(&db.pool).await?;
     let cv_api_key = crate::secret_crypto::decrypt_setting(&db.pool, cv_api_key).await.filter(|s| !s.is_empty());
     if let Some(key) = cv_api_key {
-        if let Err(e) = phase2_comicvine(&db, &client, &key, &mut issues, &mut skeletons_created, &mut candidates).await {
+        if let Err(e) = phase2_comicvine(&db, &client, &key, &mut issues, &coverage, &mut skeletons_created, &mut candidates).await {
             notes.push(format!("[Phase 2] ComicVine sync error: {}", e));
         }
     }
@@ -494,6 +523,70 @@ mod tests {
         assert!(!is_already_in_library(&issues, "14"));
         // #99 not present at all.
         assert!(!is_already_in_library(&issues, "99"));
+    }
+
+    // #203 COLLECTED coverage: a covered issue is withheld from candidates exactly like an owned one.
+    #[test]
+    fn covered_counts_as_in_library_for_candidates_only_when_an_owned_book_says_so() {
+        let issues = vec![issue("3", Some("/lib/3.cbz")), issue("21", None)];
+        let covered = vec!["21".to_string(), "22".to_string()];
+        assert!(in_library_or_covered(&issues, Some(&covered), "3"));    // on disk
+        assert!(in_library_or_covered(&issues, Some(&covered), "21"));   // a skeleton, but reprinted in an owned trade
+        assert!(in_library_or_covered(&issues, Some(&covered), "022"));  // number rules apply to coverage too
+        assert!(!in_library_or_covered(&issues, Some(&covered), "23"));
+        assert!(!in_library_or_covered(&issues, None, "21"));
+    }
+
+    /// A file-backed fixture with the three tables load_state reads (the Any driver's in-memory
+    /// handling differs per connection — the same shape attached_volumes/scanner tests use).
+    async fn fixture(tag: &str) -> Db {
+        let base = std::env::temp_dir().join(format!("omnibus_mon_{}_{}", tag, std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).expect("create fixture dir");
+        let db_file = base.join("mon.db");
+        std::fs::File::create(&db_file).expect("pre-create sqlite file");
+        let db_url = format!("file:{}", db_file.to_string_lossy().replace('\\', "/"));
+        let db = Db::connect(&db_url, 2).await.expect("connect file-backed sqlite");
+        for ddl in [
+            r#"CREATE TABLE "Series" (id TEXT PRIMARY KEY, name TEXT, publisher TEXT, year INTEGER, "metadataId" TEXT,
+                "metadataSource" TEXT, monitored INTEGER, "isManga" INTEGER DEFAULT 0, "coverUrl" TEXT)"#,
+            r#"CREATE TABLE "Issue" (id TEXT PRIMARY KEY, "seriesId" TEXT, number TEXT, "filePath" TEXT, "releaseDate" TEXT,
+                "isAnnual" INTEGER DEFAULT 0, "attachedVolumeId" TEXT, "coversIssues" TEXT)"#,
+            r#"CREATE TABLE "AttachedVolume" (id TEXT PRIMARY KEY, "seriesId" TEXT, kind TEXT)"#,
+        ] {
+            sqlx::query(ddl).execute(&db.pool).await.expect("create schema");
+        }
+        db
+    }
+
+    #[tokio::test]
+    async fn load_state_keeps_lane_rows_out_of_the_run_and_reads_only_owned_coverage() {
+        let db = fixture("coverage").await;
+        sqlx::query(r#"INSERT INTO "Series" VALUES ('s1','Absolute Batman','DC',2024,'160294','COMICVINE',1,0,NULL)"#).execute(&db.pool).await.unwrap();
+        sqlx::query(r#"INSERT INTO "AttachedVolume" VALUES ('att1','s1','COLLECTED')"#).execute(&db.pool).await.unwrap();
+        for (id, num, path, annual, lane, covers) in [
+            ("run3", "3", Some("/lib/AB 003.cbz"), 0, None, None),             // the run, on disk
+            ("run21", "21", None, 0, None, None),                              // the run, a skeleton
+            ("ann1", "1", Some("/lib/AB Annual 001.cbz"), 1, None, None),      // an annual — invisible
+            ("vol3", "3", Some("/lib/AB Vol 3.cbz"), 0, Some("att1"), Some("15-23")), // an OWNED trade, numbered "3"
+            ("vol1", "1", None, 0, Some("att1"), Some("1-6")),                 // a trade NOT owned — covers nothing
+        ] {
+            sqlx::query(r#"INSERT INTO "Issue" VALUES ($1,'s1',$2,$3,NULL,$4,$5,$6)"#)
+                .bind(id).bind(num).bind(path).bind(annual).bind(lane).bind(covers)
+                .execute(&db.pool).await.unwrap();
+        }
+
+        let (series, issues, coverage) = load_state(&db).await.unwrap();
+
+        assert_eq!(series.len(), 1);
+        let mut run: Vec<&str> = issues["s1"].iter().map(|i| i.number.as_str()).collect();
+        run.sort();
+        assert_eq!(run, vec!["21", "3"], "no lane row and no annual in the run — an owned trade numbered 3 is not issue #3");
+        assert_eq!(coverage["s1"], (15..=23).map(|n| n.to_string()).collect::<Vec<_>>(), "only the OWNED book's coverage");
+        // The trade's own "3" never made #3 look owned; #21 is withheld only through coverage.
+        assert!(!is_already_in_library(&issues["s1"], "21"));
+        assert!(in_library_or_covered(&issues["s1"], coverage.get("s1"), "21"));
+        assert!(!in_library_or_covered(&issues["s1"], coverage.get("s1"), "5"));
     }
 
     #[test]

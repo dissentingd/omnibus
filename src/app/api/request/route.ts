@@ -17,6 +17,7 @@ import { AuditLogger } from '@/lib/audit-logger';
 import { MetronProvider } from '@/lib/metadata/providers/metron';
 import { getMetronCover } from '@/lib/metadata/providers/metron-cover';
 import { normalizeFractionNumbers } from '@/lib/utils/issue-parser';
+import { ownedCoverageBySeries } from '@/lib/coverage-ownership';
 import { omnibusQueue } from '@/lib/queue';
 import { cachedCvGet } from '@/lib/metadata/metadata-cache';
 import { followSeries, followSeriesByCatalogId } from '@/lib/follows';
@@ -325,14 +326,18 @@ export async function POST(request: NextRequest) {
 
       const createdRequests = [];
 
+      // What the RUN owns on disk — never a lane row: an owned trade numbered "3" is not issue #3,
+      // nor is an annual #1 the regular #1 — plus, #203 COLLECTED coverage, what its owned collected
+      // editions reprint. Neither is asked for again; the single can still be requested on its own.
       const existingLibraryIssues = await prisma.issue.findMany({
-          where: { seriesId: series.id, filePath: { not: null } },
+          where: { seriesId: series.id, filePath: { not: null }, attachedVolumeId: null, isAnnual: false },
           select: { number: true }
       });
+      const coveredNumbers = (await ownedCoverageBySeries({ seriesId: series.id })).get(series.id) || [];
 
       // Issue #200: normalize vulgar fractions ("½" → 0.5) so half-issues count as owned/skippable.
-      const ownedIssueNumbers = new Set(existingLibraryIssues.map(i => {
-           const match = normalizeFractionNumbers(i.number).match(/(-?\d+(?:\.\d+)?)/);
+      const ownedIssueNumbers = new Set([...existingLibraryIssues.map(i => i.number), ...coveredNumbers].map(n => {
+           const match = normalizeFractionNumbers(n).match(/(-?\d+(?:\.\d+)?)/);
            return match ? parseFloat(match[1]) : NaN;
        }).filter(n => !isNaN(n)));
 

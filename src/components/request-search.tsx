@@ -404,7 +404,8 @@ export function RequestSearch() {
                               const missingAvailableIssues = volumeIssues.filter(issue => {
                                   const relIssueStatus = getIssueStatus(issue.id, selectedItem.volumeId, issue.name, issue.isReleased, issue.issueNumber, seriesBaseName);
                                   const isReleased = issue.isReleased !== false; 
-                                  return isReleased && relIssueStatus !== 'ISSUE_OWNED';
+                                  // #203 COLLECTED coverage: reprinted in an owned trade is not missing either.
+                                  return isReleased && relIssueStatus !== 'ISSUE_OWNED' && relIssueStatus !== 'ISSUE_COVERED';
                               });
                               const isAllAvailableOwned = isVolOwned && volumeIssues.length > 0 && missingAvailableIssues.length === 0;
 
@@ -632,6 +633,7 @@ export function RequestSearch() {
                                                   {relIssueStatus === 'REQUESTED' && (<div className="absolute top-1 left-1 bg-orange-500 text-white rounded-md px-1 py-0.5 text-[8px] font-bold z-20">REQUESTED</div>)}
                                                   {relIssueStatus === 'PENDING_APPROVAL' && (<div className="absolute top-1 left-1 bg-yellow-500 text-white rounded-md px-1 py-0.5 text-[8px] font-bold z-20" title="Pending Admin Approval">PENDING</div>)}
                                                   {relIssueStatus === 'ISSUE_OWNED' && (<div className="absolute top-1 left-1 bg-emerald-500 text-white rounded-md px-1 py-0.5 text-[8px] font-bold z-20">IN LIBRARY</div>)}
+                                                  {relIssueStatus === 'ISSUE_COVERED' && (<div className="absolute top-1 left-1 bg-emerald-700 text-white rounded-md px-1 py-0.5 text-[8px] font-bold z-20" title="In a collection you own">COVERED</div>)}
                                                   {relIssueStatus === 'UNRELEASED' && (<div className="absolute top-1 left-1 bg-purple-500 text-white rounded-md px-1 py-0.5 text-[8px] font-bold z-20">UNRELEASED</div>)}
                                                   {(!relIssueStatus && issue.isReleased === false) && (<div className="absolute top-1 left-1 bg-purple-500/80 text-white rounded-md px-1 py-0.5 text-[8px] font-bold z-20">UNRELEASED</div>)}
                                               </div>
