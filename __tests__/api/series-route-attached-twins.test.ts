@@ -126,4 +126,27 @@ describe('#203 beta.010 regression: attached-lane rows vs. the folder file sync'
         expect(rows).toHaveLength(1);
         expect(rows[0]).toEqual(expect.objectContaining({ number: '1', isAnnual: true, filePath: expect.stringContaining("'96 #001") }));
     });
+
+    // #203 COLLECTED coverage walk (2026-09-15): an OWNED trade in a lane named like its parent — the
+    // usual shape of a provider's "collected editions" volume — can't be name-claimed, so its file
+    // parsed as run #3 and the page flagged it as a duplicate of issue #3. A file that already
+    // belongs to a row groups under THAT row's key, whatever its filename says.
+    it("an owned collected-lane file whose name parses to a run number groups under its row — never a duplicate of that issue", async () => {
+        const F = '/comics/AbsBat';
+        (prisma.series.findFirst as any).mockResolvedValue({
+            id: 's1', name: 'Absolute Batman', year: 2024, folderPath: F, metadataId: '160294', metadataSource: 'COMICVINE',
+        });
+        (prisma.attachedVolume.findMany as any).mockResolvedValue([{ id: 'attC', name: 'Absolute Batman', kind: 'COLLECTED' }]);
+        (prisma.issue.findMany as any).mockResolvedValue([
+            { id: 'main3', number: '3', isAnnual: false, metadataId: '300003', filePath: `${F}/Absolute Batman #003 (2024).cbz`, attachedVolumeId: null },
+            { id: 'vol3', number: '3', isAnnual: false, metadataId: '1192024', filePath: `${F}/Absolute Batman Vol. 3 (2026).cbz`, attachedVolumeId: 'attC' },
+        ]);
+        disk.files = ['Absolute Batman #003 (2024).cbz', 'Absolute Batman Vol. 3 (2026).cbz'];
+
+        const body = await (await GET(getReq(`http://localhost/api/library/series?path=${encodeURIComponent(F)}`))).json();
+        expect(body.duplicates).toEqual([]);
+        expect(created()).toEqual([]);
+        expect(prisma.issue.update).not.toHaveBeenCalled();
+        expect(deletedIds()).toEqual([]);
+    });
 });

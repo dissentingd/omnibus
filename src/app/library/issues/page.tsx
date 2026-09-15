@@ -9,6 +9,7 @@ import { ConfirmationDialog } from "@/components/ui/confirmation-dialog"
 import { requestNameFor } from "@/lib/utils/request-name"
 import { normalizeFractionNumbers } from "@/lib/utils/issue-parser"
 import { filtersFromParams, paramsFromFilters, ISSUE_SORT_DEFAULT, type IssueFilters } from "@/lib/utils/issue-filters"
+import { coveredByLabel, type CoveredBy } from "@/components/covered-issues-section"
 import { Card } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -17,7 +18,7 @@ import { useToast } from "@/components/ui/use-toast"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import {
   Image as ImageIcon, Loader2, Search, SortAsc, Filter, Clock, X,
-  CalendarDays, ChevronLeft, Library as LibraryIcon, BookCheck, DownloadCloud, Check
+  CalendarDays, ChevronLeft, Library as LibraryIcon, BookCheck, DownloadCloud, Check, BookMarked
 } from "lucide-react"
 
 interface IssueRow {
@@ -39,6 +40,9 @@ interface IssueRow {
   seriesMetadataId?: string | null;
   metadataSource?: string;
   requestable?: boolean;
+  // #203 COLLECTED coverage: present when an OWNED collected edition reprints this issue (the API
+  // only sends such rows when asked with includeCovered=1).
+  coveredBy?: CoveredBy | null;
 }
 
 const DEFAULT_SORT = ISSUE_SORT_DEFAULT;
@@ -96,12 +100,16 @@ function LibraryIssuesInner() {
   const [libraryFilter, setLibraryFilter] = useState(initial.library);
   const [statusFilter, setStatusFilter] = useState<string>(initial.status);
   const [sortOption, setSortOption] = useState(initial.sort);
+  // #203 COLLECTED coverage: issues an owned trade reprints are fetched WITH the page (so the
+  // toggle's count is honest on first paint) and hidden client-side unless this is on — the same
+  // shape as the matcher's "Show ignored". Not a fetch filter: flipping it never reloads.
+  const [showCovered, setShowCovered] = useState(initial.covered);
 
   // Mirror filters into a ref so loadIssues (a stable useCallback) reads current values without deps churn.
   const filtersRef = useRef<IssueFilters>({ ...initial });
   useEffect(() => {
-    filtersRef.current = { search: debouncedSearch, publisher: publisherFilter, era: eraFilter, library: libraryFilter, status: statusFilter as IssueFilters["status"], sort: sortOption };
-  }, [debouncedSearch, publisherFilter, eraFilter, libraryFilter, statusFilter, sortOption]);
+    filtersRef.current = { search: debouncedSearch, publisher: publisherFilter, era: eraFilter, library: libraryFilter, status: statusFilter as IssueFilters["status"], sort: sortOption, covered: showCovered };
+  }, [debouncedSearch, publisherFilter, eraFilter, libraryFilter, statusFilter, sortOption, showCovered]);
 
   // Debounce the search box.
   useEffect(() => {
@@ -123,6 +131,8 @@ function LibraryIssuesInner() {
     if (f.library !== 'ALL') params.append('library', f.library);
     if (f.status !== 'ALL') params.append('status', f.status);
     if (f.search.trim()) params.append('q', f.search.trim());
+    // Covered rows ride along flagged (`coveredBy`); whether they SHOW is decided here, not there.
+    params.append('includeCovered', '1');
 
     try {
       const res = await fetch(`/api/library/issues?${params.toString()}`, { cache: 'no-store' });
@@ -162,13 +172,17 @@ function LibraryIssuesInner() {
   }, [debouncedSearch, publisherFilter, eraFilter, libraryFilter, statusFilter, sortOption, loadIssues]);
 
   // …and writes the URL, so the view a user builds is the view a shared link opens. `replace`, not
-  // `push`: filter changes are not history entries. Skipped on the seeding render so a deep link
-  // doesn't rewrite itself, and after the debounce so typing doesn't rewrite per keystroke.
+  // `push`: filter changes are not history entries. The URL is written only when it would CHANGE
+  // — so a deep link doesn't rewrite itself on the seeding render, and (after the debounce)
+  // typing doesn't rewrite per keystroke. Compared against the last write rather than a timer: a
+  // toggle flipped the instant the page lands must still reach the URL.
+  const lastWrittenQs = useRef(paramsFromFilters(initial));
   useEffect(() => {
-    if (isFirstRender.current) return;
     const qs = paramsFromFilters(filtersRef.current);
+    if (qs === lastWrittenQs.current) return;
+    lastWrittenQs.current = qs;
     router.replace(qs ? `${pathname}?${qs}` : pathname, { scroll: false });
-  }, [debouncedSearch, publisherFilter, eraFilter, libraryFilter, statusFilter, sortOption, router, pathname]);
+  }, [debouncedSearch, publisherFilter, eraFilter, libraryFilter, statusFilter, sortOption, showCovered, router, pathname]);
 
   const observer = useRef<IntersectionObserver | null>(null);
   const lastElementRef = useCallback((node: HTMLDivElement | null) => {
@@ -180,12 +194,17 @@ function LibraryIssuesInner() {
     if (node) observer.current.observe(node);
   }, [hasMore, loading, loadingMore, loadIssues]);
 
-  const hasActiveFilters = !!debouncedSearch || publisherFilter !== 'ALL' || eraFilter !== 'ALL' || libraryFilter !== 'ALL' || statusFilter !== 'ALL' || sortOption !== DEFAULT_SORT;
+  const hasActiveFilters = !!debouncedSearch || publisherFilter !== 'ALL' || eraFilter !== 'ALL' || libraryFilter !== 'ALL' || statusFilter !== 'ALL' || sortOption !== DEFAULT_SORT || showCovered;
   const resetFilters = () => {
     setSearchQuery(""); setPublisherFilter("ALL"); setEraFilter("ALL");
-    setLibraryFilter("ALL"); setStatusFilter("ALL"); setSortOption(DEFAULT_SORT);
+    setLibraryFilter("ALL"); setStatusFilter("ALL"); setSortOption(DEFAULT_SORT); setShowCovered(false);
     window.scrollTo({ top: 0, behavior: 'smooth' });
   };
+
+  // What an owned collection covers is loaded but not shown until asked; the toggle only appears
+  // once there is something behind it, and its count is what's actually loaded.
+  const coveredCount = issues.filter(i => i.coveredBy).length;
+  const visibleIssues = showCovered ? issues : issues.filter(i => !i.coveredBy);
 
   /**
    * The same request the series page files — the composite comes from the ONE shared helper, so
@@ -231,8 +250,10 @@ function LibraryIssuesInner() {
   };
 
   // Everything on screen that can still be asked for. "Shown" is honest: it's the rows loaded so
-  // far, which is what the user is looking at — not every wanted issue in the library.
-  const requestableShown = issues.filter(i => i.requestable && !requestedIds.has(i.id));
+  // far, which is what the user is looking at — not every wanted issue in the library. A covered
+  // issue is never counted, shown or not: you have the story, and the bulk action asks for what's
+  // missing. Its own Request button stays for the deliberate ask.
+  const requestableShown = issues.filter(i => i.requestable && !i.coveredBy && !requestedIds.has(i.id));
 
   const requestAllShown = async () => {
     setBulkOpen(false);
@@ -370,6 +391,21 @@ function LibraryIssuesInner() {
           </SelectContent>
         </Select>
 
+        {coveredCount > 0 && (
+          <Button
+            variant={showCovered ? "secondary" : "outline"}
+            aria-pressed={showCovered}
+            aria-label={showCovered ? "Hide covered issues" : "Show covered issues"}
+            title="Issues a collected edition you own reprints — not missing, but here if you want the singles"
+            className="h-10 sm:h-9 font-bold border-border flex-1 sm:flex-none"
+            onClick={() => setShowCovered(v => !v)}
+          >
+            <BookMarked className="w-4 h-4 mr-1 sm:mr-2 text-emerald-600 dark:text-emerald-400" />
+            <span className="hidden sm:inline">{showCovered ? 'Hide' : 'Show'} covered ({coveredCount})</span>
+            <span className="sm:hidden">{coveredCount}</span>
+          </Button>
+        )}
+
         {hasActiveFilters && (
           <Button aria-label="Clear all applied filters" variant="ghost" className="h-10 sm:h-9 text-muted-foreground hover:text-foreground px-3 flex-1 sm:flex-none" onClick={resetFilters}>
             <X className="w-4 h-4 sm:mr-2" />
@@ -388,9 +424,15 @@ function LibraryIssuesInner() {
           <p>No issues found matching your criteria.</p>
           <p className="text-xs mt-1 opacity-70">Only released issues with a known release date are shown here.</p>
         </div>
+      ) : visibleIssues.length === 0 ? (
+        <div className="text-center py-20 text-muted-foreground border-2 border-dashed rounded-lg border-border bg-muted/30">
+          <BookMarked className="w-10 h-10 mx-auto mb-3 opacity-20" />
+          <p>Everything here is covered by collected editions you own.</p>
+          <p className="text-xs mt-1 opacity-70">{coveredCount} issue{coveredCount === 1 ? '' : 's'} — use &quot;Show covered&quot; above to see them.</p>
+        </div>
       ) : (
         <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 xl:grid-cols-8 gap-4 pb-10">
-          {issues.map((issue) => (
+          {visibleIssues.map((issue) => (
             <div key={issue.id} className="flex flex-col space-y-2">
             <Link
               href={issue.seriesPath ? `/library/series?path=${encodeURIComponent(issue.seriesPath)}` : '#'}
@@ -411,8 +453,9 @@ function LibraryIssuesInner() {
                   )}
                   <div className="absolute top-1.5 left-1.5 z-30 flex flex-col gap-1 items-start">
                     <Badge className="bg-black/70 hover:bg-black/70 text-white border-0 shadow-sm px-1.5 h-4 text-[9px] font-black uppercase tracking-wider backdrop-blur-sm">#{issue.number}</Badge>
-                    {!issue.onDisk && (
-                      <Badge className="bg-blue-500 hover:bg-blue-600 text-white border-0 shadow-sm px-1.5 h-4 text-[9px] font-black uppercase tracking-wider">Wanted</Badge>
+                    {!issue.onDisk && (issue.coveredBy
+                      ? <Badge className="bg-emerald-600 hover:bg-emerald-700 text-white border-0 shadow-sm px-1.5 h-4 text-[9px] font-black uppercase tracking-wider" title={`Covered by ${coveredByLabel(issue.coveredBy)}`}>Covered</Badge>
+                      : <Badge className="bg-blue-500 hover:bg-blue-600 text-white border-0 shadow-sm px-1.5 h-4 text-[9px] font-black uppercase tracking-wider">Wanted</Badge>
                     )}
                   </div>
                   {issue.releaseDate && (
@@ -423,6 +466,9 @@ function LibraryIssuesInner() {
               <div className="px-0.5 min-w-0">
                 <p className="text-xs font-bold text-foreground truncate group-hover:text-primary transition-colors">{issue.seriesName}</p>
                 <p className="text-[10px] text-muted-foreground truncate">{issue.name ? issue.name : `Issue #${issue.number}`}</p>
+                {issue.coveredBy && (
+                  <p className="text-[10px] text-emerald-700 dark:text-emerald-400 truncate" title={coveredByLabel(issue.coveredBy)}>Covered by {coveredByLabel(issue.coveredBy)}</p>
+                )}
               </div>
             </Link>
               {/* A button can't live inside the link — it sits beneath it, so the card still opens

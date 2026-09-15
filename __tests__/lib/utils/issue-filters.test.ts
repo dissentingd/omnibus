@@ -10,7 +10,7 @@ describe('filtersFromParams', () => {
     it('lands a deep link on the filtered view', () => {
         expect(parse('status=WANTED')).toEqual({ ...DEFAULT_ISSUE_FILTERS, status: 'WANTED' });
         expect(parse('status=WANTED&library=MANGA&era=2010s&sort=release_asc&publisher=DC%20Comics&q=%20Batman%20'))
-            .toEqual({ search: 'Batman', publisher: 'DC Comics', era: '2010s', library: 'MANGA', status: 'WANTED', sort: 'release_asc' });
+            .toEqual({ search: 'Batman', publisher: 'DC Comics', era: '2010s', library: 'MANGA', status: 'WANTED', sort: 'release_asc', covered: false });
     });
 
     it('falls back to the default for anything it does not recognise', () => {
@@ -26,18 +26,28 @@ describe('filtersFromParams', () => {
         expect(parse('')).toEqual(DEFAULT_ISSUE_FILTERS);
         expect(parse('publisher=%20%20&q=%20')).toEqual(DEFAULT_ISSUE_FILTERS);
     });
+
+    it('reads the covered toggle as exactly "1", nothing looser', () => {
+        // #203 COLLECTED coverage: issues an owned trade reprints leave the Missing view unless the
+        // link says covered=1. A flag, not an enum — but still strict, so "covered=yes" is off.
+        expect(parse('status=WANTED&covered=1')).toEqual({ ...DEFAULT_ISSUE_FILTERS, status: 'WANTED', covered: true });
+        expect(parse('covered=true')).toEqual(DEFAULT_ISSUE_FILTERS);
+        expect(parse('covered=0')).toEqual(DEFAULT_ISSUE_FILTERS);
+        expect(DEFAULT_ISSUE_FILTERS.covered).toBe(false);
+    });
 });
 
 describe('paramsFromFilters', () => {
     it('writes only what differs from the defaults, so the plain page keeps a plain URL', () => {
         expect(paramsFromFilters(DEFAULT_ISSUE_FILTERS)).toBe('');
         expect(paramsFromFilters({ ...DEFAULT_ISSUE_FILTERS, status: 'WANTED' })).toBe('status=WANTED');
+        expect(paramsFromFilters({ ...DEFAULT_ISSUE_FILTERS, status: 'WANTED', covered: true })).toBe('status=WANTED&covered=1');
     });
 
     it('round-trips every field in a fixed key order', () => {
-        const full = { search: 'Batman', publisher: 'DC Comics', era: '2010s', library: 'COMICS', status: 'DOWNLOADED' as const, sort: 'release_asc' };
+        const full = { search: 'Batman', publisher: 'DC Comics', era: '2010s', library: 'COMICS', status: 'DOWNLOADED' as const, sort: 'release_asc', covered: true };
         const qs = paramsFromFilters(full);
-        expect(qs).toBe('status=DOWNLOADED&library=COMICS&publisher=DC+Comics&era=2010s&sort=release_asc&q=Batman');
+        expect(qs).toBe('status=DOWNLOADED&covered=1&library=COMICS&publisher=DC+Comics&era=2010s&sort=release_asc&q=Batman');
         expect(filtersFromParams(new URLSearchParams(qs))).toEqual(full);
     });
 

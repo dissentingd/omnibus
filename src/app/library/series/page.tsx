@@ -29,6 +29,8 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import MetadataEditorModal from "@/components/metadata-editor-modal"
 import PageManagerModal from "@/components/page-manager-modal"
 import { AttachedVolumesManager } from "@/components/attached-volumes-manager"
+import { CoverageField } from "@/components/coverage-field"
+import { CoveredIssuesSection } from "@/components/covered-issues-section"
 import { requestNameFor } from "@/lib/utils/request-name"
 
 // Loop-safe fallback for cover <img>s: on a broken cover, swap to the series cover; if that also fails,
@@ -78,7 +80,10 @@ function SeriesContent() {
   // #203 COLLECTED: trades/omnibuses attached to this series — their own shelf, out of the run.
   const [collectedEditions, setCollectedEditions] = useState<any[]>([]);
   const [missingCollectedEditions, setMissingCollectedEditions] = useState<any[]>([]);
-  
+  // #203 COLLECTED coverage: main-run issues an OWNED collected edition reprints — not missing,
+  // not on disk; each carries `coveredBy` naming the book.
+  const [coveredIssues, setCoveredIssues] = useState<any[]>([]);
+
   const [seriesInfo, setSeriesInfo] = useState<{name: string, cover: string | null, cvId: number | null, metadataId: string | null, metadataSource: string, path: string | null, id: string | null, isFavorite: boolean, isFollowing: boolean, publisher: string | null, year: string | null, description: string | null, status: string | null, bookType: string | null, monitored: boolean, isManga: boolean, universe?: string | null, seriesGroup?: string | null, matchState?: string, hasCustomCover?: boolean, genres?: string[]}>({
     name: "", cover: null, cvId: null, metadataId: null, metadataSource: 'COMICVINE', path: null, id: null, isFavorite: false, isFollowing: false, publisher: null, year: null, description: null, status: null, bookType: null, monitored: false, isManga: false, matchState: 'MATCHED', hasCustomCover: false, genres: []
   });
@@ -120,8 +125,9 @@ function SeriesContent() {
   const [reportDescription, setReportDescription] = useState("");
   const [isSubmittingReport, setIsSubmittingReport] = useState(false);
 
-  const [requestingIds, setRequestingIds] = useState<Set<number>>(new Set());
-  const [requestedIds, setRequestedIds] = useState<Set<number>>(new Set());
+  // Issue ids are strings (row ids); the old Set<number> typing predated that and only survived on `any`.
+  const [requestingIds, setRequestingIds] = useState<Set<string>>(new Set());
+  const [requestedIds, setRequestedIds] = useState<Set<string>>(new Set());
 
   const [deleteModalOpen, setDeleteModalOpen] = useState(false);
   const [isDeleting, setIsDeleting] = useState(false);
@@ -288,6 +294,7 @@ function SeriesContent() {
             setDuplicates(data.duplicates || []);
           setCollectedEditions(data.collectedEditions || []);
           setMissingCollectedEditions(data.missingCollectedEditions || []);
+          setCoveredIssues(data.coveredIssues || []);
             
             setSeriesInfo({
                 name: data.seriesName || data.name || "Unknown Series",
@@ -411,9 +418,20 @@ function SeriesContent() {
           setDuplicates(data.duplicates || []);
           setCollectedEditions(data.collectedEditions || []);
           setMissingCollectedEditions(data.missingCollectedEditions || []);
+          setCoveredIssues(data.coveredIssues || []);
       } catch (e) {
           Logger.log(`[Series] Couldn't refresh the issue lists after an attachment change: ${getErrorMessage(e)}`, 'debug');
       }
+  };
+
+  // #203 COLLECTED coverage: the Covers field saved (the server's canonical value comes back).
+  // The book keeps it locally at once; an owned book's coverage moves issues between missing and
+  // covered, so the lists are re-read quietly.
+  const handleCoverageSaved = (bookId: string, next: string | null) => {
+      const patch = (list: any[]) => list.map(b => b.id === bookId ? { ...b, coversIssues: next } : b);
+      setCollectedEditions(prev => patch(prev));
+      setMissingCollectedEditions(prev => patch(prev));
+      void reloadIssues();
   };
 
   const handleScanDirectory = async () => {
@@ -430,6 +448,7 @@ function SeriesContent() {
           setDownloadedIssues(data.downloadedIssues || []);
           setMissingIssues(data.missingIssues || []);
           
+          setCoveredIssues(data.coveredIssues || []);
           setSeriesInfo(prev => ({
               ...prev,
               name: data.seriesName || data.name || prev.name,
@@ -500,6 +519,7 @@ function SeriesContent() {
         if (!refData.error) {
           setDownloadedIssues(refData.downloadedIssues || []);
           setMissingIssues(refData.missingIssues || []);
+          setCoveredIssues(refData.coveredIssues || []);
         }
       } catch {}
 
@@ -1754,6 +1774,15 @@ function SeriesContent() {
                                       <div className="min-w-0 flex-1">
                                           <p className="text-sm font-bold text-foreground truncate" title={book.name}>{book.name}</p>
                                           <p className="text-xs text-muted-foreground">Vol. {book.number}</p>
+                                          {/* #203 COLLECTED coverage: which run issues this book reprints. Admins edit it in place. */}
+                                          <CoverageField
+                                              issueId={book.id}
+                                              bookLabel={book.name || `Vol. ${book.number}`}
+                                              value={book.coversIssues ?? null}
+                                              canEdit={isAdmin}
+                                              onSaved={(next) => handleCoverageSaved(book.id, next)}
+                                              className="mt-1"
+                                          />
                                       </div>
                                       {/* Collections sit outside the run's missing-issue math, so they
                                           need their own way to be asked for — searched by the book's
@@ -2002,6 +2031,9 @@ function SeriesContent() {
                               <CheckCircle2 className="w-10 h-10 text-green-500 mb-3" />
                               <p className="text-lg font-black text-green-800 dark:text-green-400 uppercase tracking-tight">Your collection is complete!</p>
                               <p className="text-sm text-green-700/70 dark:text-green-500/70 mt-1">All known issues are currently in your library.</p>
+                              {coveredIssues.length > 0 && (
+                                  <p className="text-xs text-green-700/70 dark:text-green-500/70 mt-1">{coveredIssues.length} of them only as part of a collected edition you own — listed below.</p>
+                              )}
                           </div>
                       ) : viewMode === 'grid' ? (
                           <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-1 lg:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4 gap-6 pb-10">
@@ -2065,6 +2097,20 @@ function SeriesContent() {
                           </div>
                       )}
                   </div>
+              )}
+
+              {/* #203 COLLECTED coverage: the singles an owned collection reprints — not missing, not on disk. */}
+              {seriesInfo.cvId && (
+                  <CoveredIssuesSection
+                      issues={coveredIssues}
+                      seriesName={seriesInfo.name}
+                      seriesCover={seriesInfo.cover}
+                      canRequest={!!canRequest}
+                      requestingIds={requestingIds}
+                      requestedIds={requestedIds}
+                      onRequest={(issue) => { void handleRequestMissing(issue); }}
+                      onSelect={(issue) => setActiveIssue(issue)}
+                  />
               )}
           </div>
         </div>

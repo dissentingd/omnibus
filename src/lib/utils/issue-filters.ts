@@ -25,6 +25,10 @@ export interface IssueFilters {
     library: string;
     status: IssueStatusFilter;
     sort: string;
+    // #203 COLLECTED coverage: whether issues an OWNED collected edition reprints are shown. They
+    // are not missing — the page hides them unless asked — but the ask is part of the view, so
+    // it rides the URL like every other filter. A flag, read strictly as "1".
+    covered: boolean;
 }
 
 export const DEFAULT_ISSUE_FILTERS: IssueFilters = {
@@ -34,6 +38,7 @@ export const DEFAULT_ISSUE_FILTERS: IssueFilters = {
     library: "ALL",
     status: "ALL",
     sort: ISSUE_SORT_DEFAULT,
+    covered: false,
 };
 
 function pick<T extends readonly string[]>(raw: string | null, allowed: T, fallback: T[number]): T[number] {
@@ -52,6 +57,7 @@ export function filtersFromParams(params: URLSearchParams | null | undefined): I
         library: pick(params.get("library"), LIBRARY_VALUES, "ALL"),
         status: pick(params.get("status"), STATUS_VALUES, "ALL"),
         sort: pick(params.get("sort"), SORT_VALUES, ISSUE_SORT_DEFAULT),
+        covered: (params.get("covered") || "").trim() === "1",
     };
 }
 
@@ -60,6 +66,7 @@ export function filtersFromParams(params: URLSearchParams | null | undefined): I
 export function paramsFromFilters(f: IssueFilters): string {
     const p = new URLSearchParams();
     if (f.status !== "ALL") p.set("status", f.status);
+    if (f.covered) p.set("covered", "1");
     if (f.library !== "ALL") p.set("library", f.library);
     if (f.publisher !== "ALL") p.set("publisher", f.publisher);
     if (f.era !== "ALL") p.set("era", f.era);

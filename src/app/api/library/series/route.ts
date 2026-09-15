@@ -213,6 +213,16 @@ export async function GET(request: Request) {
                 select: { id: true, name: true, kind: true },
             });
 
+            // A file that already belongs to a row groups under THAT row's key — its lane, or its
+            // number — whatever its filename parses to. An OWNED trade in a lane named like its
+            // parent (the usual shape of a provider's "collected editions" volume) can't be
+            // name-claimed, so "Absolute Batman Vol. 3" read as run #3 and the page flagged it as
+            // a duplicate of issue #3 (#203 COLLECTED coverage walk, 2026-09-15).
+            const rowByPath = new Map<string, any>();
+            for (const i of existingIssues) {
+                if (i.filePath && !deletedIds.has(i.id)) rowByPath.set(samePath(i.filePath), i);
+            }
+
             const filesByNum = new Map<string, { number: string; isAnnual: boolean; files: string[] }>();
             for (const file of files) {
                 if (COMIC_EXT_REGEX.test(file)) {
@@ -220,11 +230,18 @@ export async function GET(request: Request) {
                     // without it every volume parsed as #8 and collapsed into one dup-flagged row.
                     // #203: files group by (annual domain, number) — "Batman Annual 001" and
                     // "Batman 001" are different slots, not a duplicate pair.
-                    const lane = attachmentRefs.length > 0 ? attachmentForFilename(file, seriesRecord?.name || '', attachmentRefs) : null;
-                    const desc = lane
-                        ? { number: lane.number, isAnnual: lane.kind === 'ANNUAL' }
-                        : describeIssueFromFilename(file, seriesRecord?.name || undefined);
-                    const key = lane ? `att:${lane.id}:${desc.number}` : `${desc.isAnnual ? 'annual:' : ''}${desc.number}`;
+                    const owner = rowByPath.get(samePath(path.join(folderPath, file)));
+                    const lane = owner ? null : (attachmentRefs.length > 0 ? attachmentForFilename(file, seriesRecord?.name || '', attachmentRefs) : null);
+                    const desc = owner
+                        ? { number: String(owner.number), isAnnual: !!owner.isAnnual }
+                        : lane
+                            ? { number: lane.number, isAnnual: lane.kind === 'ANNUAL' }
+                            : describeIssueFromFilename(file, seriesRecord?.name || undefined);
+                    const key = owner
+                        ? (owner.attachedVolumeId
+                            ? `att:${owner.attachedVolumeId}:${desc.number.replace(/^0+(?=\d)/, '')}`
+                            : `${desc.isAnnual ? 'annual:' : ''}${desc.number.replace(/^0+(?=\d)/, '')}`)
+                        : lane ? `att:${lane.id}:${desc.number}` : `${desc.isAnnual ? 'annual:' : ''}${desc.number}`;
                     const entry = filesByNum.get(key);
                     if (entry) entry.files.push(file);
                     else filesByNum.set(key, { number: desc.number, isAnnual: desc.isAnnual, files: [file] });
