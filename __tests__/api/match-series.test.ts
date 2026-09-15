@@ -11,6 +11,7 @@ const mocks = vi.hoisted(() => ({
     findUniqueSetting: vi.fn(),
     findUniqueSeries: vi.fn(),
     findFirstSeries: vi.fn(),
+    findManySeries: vi.fn(),
     createSeries: vi.fn(),
     log: vi.fn(),
     getSeriesDetails: vi.fn(),
@@ -46,7 +47,8 @@ vi.mock('@/lib/db', () => ({
     prisma: {
         library: { findMany: mocks.findManyLibraries },
         systemSetting: { findMany: mocks.findManySettings, findUnique: mocks.findUniqueSetting },
-        series: { findUnique: mocks.findUniqueSeries, findFirst: mocks.findFirstSeries, create: mocks.createSeries, update: mocks.updateSeries, delete: mocks.deleteSeries },
+        // findMany: the folder-collision guard asks who owns the computed folder before any write.
+        series: { findUnique: mocks.findUniqueSeries, findFirst: mocks.findFirstSeries, findMany: mocks.findManySeries, create: mocks.createSeries, update: mocks.updateSeries, delete: mocks.deleteSeries },
         issue: { findMany: mocks.findManyIssues, updateMany: mocks.updateManyIssues, findFirst: mocks.findFirstIssue, create: mocks.createIssue, update: mocks.updateIssue },
         request: { findMany: mocks.findManyRequests, updateMany: mocks.updateManyRequests },
         $transaction: mocks.transaction
@@ -106,6 +108,7 @@ describe('API Route: Smart Matcher (/api/library/match-series)', () => {
         mocks.findManyLibraries.mockResolvedValue([{ id: 'lib_1', path: '/comics', isDefault: true }]);
         mocks.findUniqueSeries.mockResolvedValue(null);
         mocks.findFirstSeries.mockResolvedValue(null);
+        mocks.findManySeries.mockResolvedValue([]); // no series owns the computed folder
         mocks.findManySettings.mockResolvedValue([]);
         mocks.findManyRequests.mockResolvedValue([]);
         mocks.findManyIssues.mockResolvedValue([]);

@@ -24,6 +24,7 @@ import { countArchivePages } from '@/lib/utils/archive-pages';
 import { cachedCvGet } from '@/lib/metadata/metadata-cache';
 import { findLocalCoverBasename } from '@/lib/utils/cover-plan';
 import { parseComicVineCredits } from '@/lib/utils';
+import { folderOwner, suggestFreeFolderName, attachAsCollected } from '@/lib/match-collision';
 
 // #199 round 4 Beta B: only non-empty credit groups become columns (never write a literal '[]' —
 // issue #179), stringified to the Issue JSON-array convention.
@@ -214,7 +215,80 @@ export async function POST(request: Request) {
         .trim();
 
     const folderParts = relFolderPath.split(/[/\\]/).map((p:string) => p.trim()).filter(Boolean);
-    const newFolderPath = path.join(targetLib.path, ...folderParts).replace(/\\/g, '/');
+    let newFolderPath = path.join(targetLib.path, ...folderParts).replace(/\\/g, '/');
+
+    // Folder collision (field report by robotshavehearts2, "Image does it a lot"): a run and its
+    // collected editions are separate provider volumes that often share a name AND a year, so the
+    // pattern computes the SAME folder for both — and this route used to repoint the second series
+    // at the first one's folder and merge the files in. Two series never own one folder. If another
+    // series owns this one, nothing is written: the caller is told who, and what it can do — attach
+    // the volume to that series as a collected edition (the usual answer), or take a folder name of
+    // its own. The rows this match legitimately repoints are not "another series".
+    const excludeIds = [unmatchedRecord?.id, existingRecord?.id].filter((x): x is string => !!x);
+    const resolution = req.collision && typeof req.collision === 'object' ? req.collision : null;
+    if (resolution?.mode === 'rename') {
+        const folderName = typeof resolution.folderName === 'string' ? resolution.folderName.trim() : '';
+        if (!folderName || /[\\/]/.test(folderName) || folderName === '.' || folderName === '..') {
+            return NextResponse.json({ error: "That folder name can't be used — one name, no slashes." }, { status: 400 });
+        }
+        const safeFolderName = sanitizeFilename(folderName).trim();
+        if (!safeFolderName) return NextResponse.json({ error: "That folder name can't be used." }, { status: 400 });
+        newFolderPath = `${path.dirname(newFolderPath)}/${safeFolderName}`.replace(/\\/g, '/');
+    }
+    const owner = await folderOwner(newFolderPath, excludeIds);
+    if (owner && resolution?.mode === 'attach') {
+        const attached = await attachAsCollected({
+            owner,
+            source: oldFolderPath,
+            sourceSeriesId: unmatchedRecord?.id ?? null,
+            metadataSource: targetSource,
+            volumeId: targetMetaId,
+            volumeName: realName,
+            volumeYear: realYear,
+            config,
+            libraryRoots: [...libraries.map(l => l.path), unmatchedDir],
+        });
+        if (attached.error) {
+            Logger.log(`[Match Series] Attach-as-collected did not complete for volume ${targetMetaId}: ${attached.error}`, 'warn');
+            return NextResponse.json({ error: attached.error, attachmentId: attached.attachmentId }, { status: 502 });
+        }
+        // series.json is half of the zero-API restore; fire-and-forget, never gating the answer.
+        try {
+            void Promise.resolve(omnibusQueue.add('EXPORT_SERIES_JSON', { type: 'EXPORT_SERIES_JSON', seriesId: owner.id }, { jobId: `EXPORT_SJ_COLLISION_${owner.id}_${Date.now()}` }))
+                .catch(e => Logger.log(`[Match Series] Couldn't queue the series.json export: ${getErrorMessage(e)}`, 'warn'));
+        } catch (e) {
+            Logger.log(`[Match Series] Couldn't queue the series.json export: ${getErrorMessage(e)}`, 'warn');
+        }
+        const actorId = (session?.user as any)?.id;
+        if (actorId) {
+            await AuditLogger.log('MATCH_SERIES_AS_COLLECTED', {
+                oldPath: oldFolderPath, attachedTo: owner.id, attachedToName: owner.name, metadataSource: targetSource, volumeId: targetMetaId,
+                moved: attached.moved, absorbed: attached.absorbed, claimed: attached.claimed, skeletonsReplaced: attached.skeletonsReplaced, conflicts: attached.conflicts,
+            }, actorId);
+        }
+        if (attached.conflicts > 0) {
+            Logger.log(`[Match Series] Attached "${realName}" to ${owner.name} with ${attached.conflicts} file(s) left in place (name already taken).`, 'warn');
+        }
+        revalidateTag('library'); revalidatePath('/library'); revalidatePath('/library/series');
+        return NextResponse.json({
+            success: true, newPath: owner.folderPath, metadataId: targetMetaId,
+            attachedTo: { id: owner.id, name: owner.name, folderPath: owner.folderPath },
+            attachmentId: attached.attachmentId, moved: attached.moved, absorbed: attached.absorbed, claimed: attached.claimed,
+            skeletonsReplaced: attached.skeletonsReplaced, conflicts: attached.conflicts,
+        });
+    }
+    if (owner) {
+        const suggestedFolderName = await suggestFreeFolderName(newFolderPath, excludeIds);
+        const ownerLabel = owner.year ? `${owner.name} (${owner.year})` : owner.name;
+        return NextResponse.json({
+            error: `"${realName}" would be filed as "${path.basename(newFolderPath)}", which already belongs to ${ownerLabel}. Two series can't share a folder — accept it on its own to choose what to do.`,
+            collision: {
+                seriesId: owner.id, seriesName: owner.name, year: owner.year, publisher: owner.publisher,
+                metadataSource: owner.metadataSource, metadataId: owner.metadataId, folderPath: owner.folderPath,
+                suggestedFolderName, volumeName: realName, volumeYear: realYear || null,
+            },
+        }, { status: 409 });
+    }
 
     const pubDir = path.dirname(newFolderPath);
     // ensureLibraryDir = mkdir + the operator's UMASK-derived folder mode (#199 read-only folders).

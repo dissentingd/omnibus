@@ -29,6 +29,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import MetadataEditorModal from "@/components/metadata-editor-modal"
 import PageManagerModal from "@/components/page-manager-modal"
 import { AttachedVolumesManager } from "@/components/attached-volumes-manager"
+import { FolderCollisionDialog, type FolderCollision, type CollisionResolution } from "@/components/folder-collision-dialog"
 import { CoverageField } from "@/components/coverage-field"
 import { CoveredIssuesSection } from "@/components/covered-issues-section"
 import { requestNameFor } from "@/lib/utils/request-name"
@@ -109,6 +110,8 @@ function SeriesContent() {
   const [searchResults, setSearchResults] = useState<any[]>([]);
   const [isSearching, setIsSearching] = useState(false);
   const [isMatching, setIsMatching] = useState(false);
+  // A re-match whose folder another series already owns (409 from match-series): attach or rename.
+  const [collisionPrompt, setCollisionPrompt] = useState<{ item: any; collision: FolderCollision } | null>(null);
   
   const [searchPage, setSearchPage] = useState(1);
   const [hasMoreSearch, setHasMoreSearch] = useState(false);
@@ -868,12 +871,12 @@ function SeriesContent() {
       }
   }
 
-  const handleMatch = async (item: any) => {
+  const handleMatch = async (item: any, resolution?: CollisionResolution) => {
       setIsMatching(true);
       try {
           const safeYear = item.year ? item.year.toString() : new Date().getFullYear().toString();
           const safePublisher = item.publisher || "Unknown";
-          
+
           const res = await fetch('/api/library/match-series', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
@@ -883,12 +886,24 @@ function SeriesContent() {
                   metadataSource: searchProvider,
                   name: item.name || "Unknown",
                   year: safeYear,
-                  publisher: safePublisher
+                  publisher: safePublisher,
+                  ...(resolution ? { collision: resolution } : {})
               })
           });
           const data = await res.json();
+          if (res.status === 409 && data.collision) {
+              // The folder another series owns: ask — attach as a collected edition, or a name of its own.
+              setCollisionPrompt({ item, collision: data.collision });
+              setIsMatching(false);
+              return;
+          }
           if (data.success) {
-              toast({ title: "Series Matched!" });
+              setCollisionPrompt(null);
+              if (data.attachedTo) {
+                  toast({ title: "Added as a collected edition", description: `${item.name} now sits under ${data.attachedTo.name} — ${data.moved} file(s) moved into its folder${data.conflicts > 0 ? `, ${data.conflicts} left in place` : ''}.` });
+              } else {
+                  toast({ title: "Series Matched!" });
+              }
               // No autoSync param: match-series already queued the METADATA_SYNC server-side, and a
               // second queue from this page raced it — two concurrent syncs interleaving on the same
               // issue rows was the corruption vector of issue #194.
@@ -2117,6 +2132,15 @@ function SeriesContent() {
       )}
 
       {/* --- DIALOGS --- */}
+
+      {/* A re-match whose folder another series already owns: attach as a collected edition, or a folder name of its own. */}
+      <FolderCollisionDialog
+          open={!!collisionPrompt}
+          collision={collisionPrompt?.collision ?? null}
+          busy={isMatching}
+          onCancel={() => { if (!isMatching) setCollisionPrompt(null); }}
+          onResolve={(resolution) => { if (collisionPrompt) void handleMatch(collisionPrompt.item, resolution); }}
+      />
 
       {/* Admin: move the selected issues to another series (fixes mis-filed/merged issues) */}
       <Dialog open={moveDialogOpen} onOpenChange={(o) => { setMoveDialogOpen(o); if (!o) { setMoveSearch(""); setMoveResults([]); setMoveTargetId(null); setMoveNewName(""); } }}>
