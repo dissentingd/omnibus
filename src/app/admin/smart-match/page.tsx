@@ -20,6 +20,8 @@ import { extractIssueNumber } from "@/lib/utils/issue-parser"
 import { buildManualSuggestion, buildKeepCarry, cleanProviderId, findIssueIdByNumber, resolveIssueIdByNumber, acceptableForBulk, seriesQueryFromName, pickSuggestion } from "@/lib/utils/smart-match-search"
 import SmartMatchMetadataDialog, { type SmartMatchOverride, buildFolderPreview, shouldEmbedIssueCover, COMIC_INFO_DEFAULT_KEYS } from "@/components/smart-match-metadata-dialog"
 import { FolderCollisionDialog, type FolderCollision, type CollisionResolution } from "@/components/folder-collision-dialog"
+import { AttachLocalCollectedDialog } from "@/components/attach-local-collected-dialog"
+import { BookMarked } from "lucide-react"
 import SmartMatchBoundIssue from "@/components/smart-match-bound-issue"
 import { ConfirmationDialog } from "@/components/ui/confirmation-dialog"
 
@@ -105,6 +107,8 @@ export default function SmartMatchPage() {
     // attach-as-collected or a folder name of its own, and the accept is re-sent with that choice.
     const [collisionPrompt, setCollisionPrompt] = useState<{ series: any; suggestion: any; collision: FolderCollision } | null>(null);
     const [collisionBusy, setCollisionBusy] = useState(false);
+    // A trade the provider has no volume for: attach it to a series of yours by name, as a LOCAL collected edition.
+    const [localAttachItem, setLocalAttachItem] = useState<any | null>(null);
     const [loading, setLoading] = useState(true);
 
     const [manualMatchOpen, setManualMatchOpen] = useState(false);
@@ -1365,6 +1369,16 @@ export default function SmartMatchPage() {
                                     <Button
                                         size="sm"
                                         variant="outline"
+                                        disabled={isSelectionMode}
+                                        className="flex-1 md:flex-none font-bold border-primary/30 text-primary hover:bg-primary/10"
+                                        onClick={(e) => { e.stopPropagation(); setLocalAttachItem(series); }}
+                                        title="Not on the provider? Put it under a series you have as a collected edition, by name"
+                                    >
+                                        <BookMarked className="w-4 h-4 md:mr-2" /> <span className="hidden md:inline">Attach to Series</span>
+                                    </Button>
+                                    <Button
+                                        size="sm"
+                                        variant="outline"
                                         disabled={isSelectionMode || pageManagerLoading}
                                         className="flex-1 md:flex-none font-bold border-primary/30 text-primary hover:bg-primary/10"
                                         onClick={(e) => { e.stopPropagation(); openPageManager([series]); }}
@@ -1857,6 +1871,18 @@ export default function SmartMatchPage() {
                     } finally {
                         setCollisionBusy(false);
                     }
+                }}
+            />
+
+            {/* LOCAL COLLECTED EDITION — a trade the provider has no volume for, attached to a series by name. */}
+            <AttachLocalCollectedDialog
+                open={!!localAttachItem}
+                item={localAttachItem}
+                onClose={() => setLocalAttachItem(null)}
+                onDone={() => {
+                    const doneId = localAttachItem?.id;
+                    setUnmatched(prev => prev.filter(s => s.id !== doneId));
+                    setLocalAttachItem(null);
                 }}
             />
 

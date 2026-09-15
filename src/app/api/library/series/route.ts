@@ -210,8 +210,12 @@ export async function GET(request: Request) {
             // has no row yet it is created in the lane's domain for the engine's claim to bind.
             const attachmentRefs = await prisma.attachedVolume.findMany({
                 where: { seriesId: seriesRecord.id },
-                select: { id: true, name: true, kind: true },
+                select: { id: true, name: true, kind: true, metadataSource: true },
             });
+            // A LOCAL lane has no engine claim, so a new file whose name says it belongs to one is
+            // bound to it HERE, outright — a provider lane's file is still created unbound for the
+            // engine's id-anchored claim.
+            const localLaneIds = new Set(attachmentRefs.filter(a => (a as any).metadataSource === 'LOCAL').map(a => a.id));
 
             // A file that already belongs to a row groups under THAT row's key — its lane, or its
             // number — whatever its filename parses to. An OWNED trade in a lane named like its
@@ -223,7 +227,7 @@ export async function GET(request: Request) {
                 if (i.filePath && !deletedIds.has(i.id)) rowByPath.set(samePath(i.filePath), i);
             }
 
-            const filesByNum = new Map<string, { number: string; isAnnual: boolean; files: string[] }>();
+            const filesByNum = new Map<string, { number: string; isAnnual: boolean; files: string[]; localLaneId?: string }>();
             for (const file of files) {
                 if (COMIC_EXT_REGEX.test(file)) {
                     // Series-name hint keeps title digits (Kaiju No. 8) out of the issue number —
@@ -244,7 +248,7 @@ export async function GET(request: Request) {
                         : lane ? `att:${lane.id}:${desc.number}` : `${desc.isAnnual ? 'annual:' : ''}${desc.number}`;
                     const entry = filesByNum.get(key);
                     if (entry) entry.files.push(file);
-                    else filesByNum.set(key, { number: desc.number, isAnnual: desc.isAnnual, files: [file] });
+                    else filesByNum.set(key, { number: desc.number, isAnnual: desc.isAnnual, files: [file], localLaneId: lane && localLaneIds.has(lane.id) ? lane.id : undefined });
                 }
             }
 
@@ -277,9 +281,10 @@ export async function GET(request: Request) {
                 } else if (!creatingNums.has(key)) {
                     createsToFire.push({
                         seriesId: seriesRecord.id,
-                        metadataId: `unmatched_${Math.random()}`,
-                        metadataSource: 'LOCAL',
-                        matchState: 'UNMATCHED',
+                        ...(group.localLaneId
+                            // A LOCAL lane's book: bound now, identified by lane and number (stable across a wipe).
+                            ? { attachedVolumeId: group.localLaneId, metadataId: `local_${group.localLaneId}_${group.number}`, metadataSource: 'LOCAL', matchState: 'MATCHED', name: `Vol. ${group.number}` }
+                            : { metadataId: `unmatched_${Math.random()}`, metadataSource: 'LOCAL', matchState: 'UNMATCHED' }),
                         number: group.number,
                         isAnnual: group.isAnnual,
                         status: "DOWNLOADED",

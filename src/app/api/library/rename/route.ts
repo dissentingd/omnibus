@@ -1,7 +1,7 @@
 // src/app/api/library/rename/route.ts
 import { NextRequest, NextResponse } from 'next/server';
 import { prisma } from '@/lib/db';
-import { filePatternForIssue } from '@/lib/utils/file-pattern';
+import { filePatternForIssue, seriesTokenForIssue } from '@/lib/utils/file-pattern';
 import fs from 'fs-extra';
 import path from 'path';
 import { getToken } from 'next-auth/jwt';
@@ -131,8 +131,9 @@ export async function POST(request: NextRequest) {
 
         const issues = await prisma.issue.findMany({
             where: { seriesId: s.id },
-            // #203 COLLECTED: the attachment's kind decides the naming template.
-            include: { attachedVolume: { select: { kind: true } } },
+            // #203 COLLECTED: the attachment's kind decides the naming template; its source and
+            // name decide what {Series} means for a LOCAL edition's books (seriesTokenForIssue).
+            include: { attachedVolume: { select: { kind: true, metadataSource: true, name: true } } },
         });
 
         // Only act if at least one real file exists (the recorded folder, or any issue file wherever it
@@ -189,13 +190,22 @@ export async function POST(request: NextRequest) {
 
             // Annual, collected, manga or plain — one shared resolver, twinned with the engine's
             // renamer.rs, so the preview and both renamers can never disagree about the result.
+            const isCollected = (issue as any).attachedVolume?.kind === 'COLLECTED';
             const patternToUse = filePatternForIssue({
                 isAnnual: (issue as any).isAnnual,
-                isCollected: (issue as any).attachedVolume?.kind === 'COLLECTED',
+                isCollected,
                 isManga: s.isManga,
                 filePattern: activeFilePattern,
                 mangaFilePattern: activeMangaFilePattern,
                 collectedFilePattern: activeCollectedFilePattern,
+            });
+            // A LOCAL collected edition's books are named after the edition — its files' names are
+            // the only claim it has (twinned with the engine renamer + the preview).
+            const seriesToken = seriesTokenForIssue({
+                isCollected,
+                attachmentSource: (issue as any).attachedVolume?.metadataSource,
+                attachmentName: (issue as any).attachedVolume?.name,
+                seriesName: s.name || 'Unknown',
             });
             const issueYear = issue.releaseDate ? issue.releaseDate.split('-')[0] : (s.year?.toString() || '0000');
 
@@ -208,7 +218,7 @@ export async function POST(request: NextRequest) {
 
             let newFileName = patternToUse
                 .replace(/{Publisher}/gi, s.publisher || 'Unknown')
-                .replace(/{Series}/gi, s.name || 'Unknown')
+                .replace(/{Series}/gi, seriesToken)
                 .replace(/{Year}/gi, s.year?.toString() || '0000')
                 .replace(/{VolumeYear}/gi, s.year?.toString() || '0000')
                 .replace(/{IssueYear}/gi, issueYear)

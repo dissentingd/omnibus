@@ -16,8 +16,14 @@ import { getErrorMessage } from '@/lib/utils/error';
 import { AuditLogger } from '@/lib/audit-logger';
 import { ENGINE_URL, engineHeaders, engineFetchLong } from '@/lib/engine';
 import { omnibusQueue } from '@/lib/queue';
+import fs from 'fs';
+import { randomUUID } from 'crypto';
+import { UNMATCHED_DIR, isPathWithinRoots } from '@/lib/utils/paths';
+import { attachAsCollected } from '@/lib/match-collision';
 
-const VALID_SOURCES = ['COMICVINE', 'METRON'];
+// LOCAL: a collected edition (or annual run) the provider has no volume for — attached by name,
+// no sync lane; its books are the files whose names carry it (field report by robotshavehearts2).
+const VALID_SOURCES = ['COMICVINE', 'METRON', 'LOCAL'];
 const VALID_KINDS = ['ANNUAL', 'COLLECTED'];
 
 /**
@@ -37,6 +43,84 @@ async function requireAdmin() {
     const session = await getServerSession(await getAuthOptions());
     if (session?.user?.role !== 'ADMIN') return null;
     return session;
+}
+
+/**
+ * A LOCAL attachment: named by the admin, keyed by a generated local id, reused by name on the same
+ * series. Without a sourcePath the engine claims the folder's files whose names carry it (the same
+ * pass a provider lane runs, minus the fetch). With one — a folder or file dropped into /unmatched
+ * — the collision helper moves it under the series and makes its rows the lane's books outright.
+ */
+async function attachLocal(session: any, series: any, kind: string, body: any) {
+    const name = typeof body?.name === 'string' ? body.name.trim() : '';
+    if (!name) return NextResponse.json({ error: 'A local collected edition needs a name.' }, { status: 400 });
+    const startYear = body?.startYear ? parseInt(body.startYear) || null : null;
+
+    const existing = await prisma.attachedVolume.findFirst({ where: { seriesId: series.id, metadataSource: 'LOCAL', name } });
+    const volumeId = existing?.volumeId || `local_${randomUUID()}`;
+
+    const sourcePath = typeof body?.sourcePath === 'string' && body.sourcePath.trim() ? body.sourcePath.trim() : null;
+    if (sourcePath) {
+        const libraries = await prisma.library.findMany();
+        const roots = [...libraries.map((l: any) => l.path), UNMATCHED_DIR];
+        if (!isPathWithinRoots(sourcePath, roots)) return NextResponse.json({ error: 'Unauthorized path access' }, { status: 403 });
+        if (!fs.existsSync(sourcePath)) return NextResponse.json({ error: 'File/Folder not found.' }, { status: 404 });
+        const sourceSeries = await prisma.series.findFirst({ where: { folderPath: sourcePath }, select: { id: true } });
+
+        const result = await attachAsCollected({
+            owner: {
+                id: series.id, name: series.name, year: series.year ?? null, publisher: series.publisher ?? null,
+                metadataSource: series.metadataSource || 'COMICVINE', metadataId: series.metadataId ?? null,
+                folderPath: series.folderPath, isManga: !!series.isManga,
+            },
+            source: sourcePath, sourceSeriesId: sourceSeries?.id ?? null,
+            metadataSource: 'LOCAL', volumeId, volumeName: name, volumeYear: startYear || 0,
+            config: {}, libraryRoots: roots,
+        });
+        if (result.error) return NextResponse.json({ success: false, attachmentId: result.attachmentId, error: result.error }, { status: 502 });
+
+        queueSeriesJsonExport(series.id, `ATTACH_LOCAL_${result.attachmentId}`);
+        await AuditLogger.log('ATTACH_VOLUME', {
+            seriesId: series.id, seriesName: series.name, metadataSource: 'LOCAL', volumeId, kind, name, local: true, sourcePath,
+            moved: result.moved, absorbed: result.absorbed, claimed: result.claimed, conflicts: result.conflicts,
+        }, session.user.id);
+        return NextResponse.json({
+            success: true, local: true, attachmentId: result.attachmentId, name, summary: null,
+            moved: result.moved, absorbed: result.absorbed, claimed: result.claimed, skeletonsReplaced: result.skeletonsReplaced, conflicts: result.conflicts,
+        });
+    }
+
+    const attachment = await prisma.attachedVolume.upsert({
+        where: { seriesId_metadataSource_volumeId: { seriesId: series.id, metadataSource: 'LOCAL', volumeId } },
+        update: { kind, name, ...(startYear ? { startYear } : {}) },
+        create: { seriesId: series.id, metadataSource: 'LOCAL', volumeId, kind, name, startYear },
+    });
+
+    let summary: any = null;
+    try {
+        const res = await engineFetchLong(ENGINE_URL + '/api/metadata/attach-sync', {
+            method: 'POST',
+            headers: engineHeaders({ 'Content-Type': 'application/json' }),
+            body: JSON.stringify({ attachment_id: attachment.id, claim: true }),
+        });
+        const payload = await res.json().catch(() => null);
+        if (!res.ok || !payload?.ok) {
+            const message = payload?.error || `engine returned ${res.status}`;
+            Logger.log(`[Attachments API] Local claim pass failed for "${name}": ${message}`, 'warn');
+            return NextResponse.json({ success: false, attachmentId: attachment.id, error: message }, { status: 502 });
+        }
+        summary = Array.isArray(payload.results) ? payload.results[0] : null;
+    } catch (e) {
+        Logger.log(`[Attachments API] Engine unreachable for the local claim pass: ${getErrorMessage(e)}`, 'error');
+        return NextResponse.json({ success: false, attachmentId: attachment.id, error: 'The engine is unreachable.' }, { status: 502 });
+    }
+
+    queueSeriesJsonExport(series.id, `ATTACH_LOCAL_${attachment.id}`);
+    await AuditLogger.log('ATTACH_VOLUME', { seriesId: series.id, seriesName: series.name, metadataSource: 'LOCAL', volumeId, kind, name, local: true, summary }, session.user.id);
+    return NextResponse.json({
+        success: true, local: true, attachmentId: attachment.id, name,
+        summary: summary ? { total: summary.total, claimed: summary.claimed, created: summary.created, updated: summary.updated, unclaimed: summary.unclaimed } : null,
+    });
 }
 
 /** The attachments on a series, with the size of each lane. */
@@ -89,11 +173,12 @@ export async function POST(request: Request) {
 
         const body = await request.json();
         const seriesId: string = body?.seriesId;
-        const volumeId: string = body?.volumeId != null ? String(body.volumeId).trim() : '';
         const metadataSource: string = (body?.metadataSource || 'COMICVINE').toUpperCase();
         const kind: string = (body?.kind || 'ANNUAL').toUpperCase();
+        const isLocal = metadataSource === 'LOCAL';
+        const volumeId: string = isLocal ? '' : (body?.volumeId != null ? String(body.volumeId).trim() : '');
 
-        if (!seriesId || !volumeId) {
+        if (!seriesId || (!isLocal && !volumeId)) {
             return NextResponse.json({ error: 'Missing seriesId or volumeId' }, { status: 400 });
         }
         if (!VALID_SOURCES.includes(metadataSource)) {
@@ -105,6 +190,8 @@ export async function POST(request: Request) {
 
         const series = await prisma.series.findUnique({ where: { id: seriesId } });
         if (!series) return NextResponse.json({ error: 'Series not found' }, { status: 404 });
+
+        if (isLocal) return await attachLocal(session, series, kind, body);
 
         // Attaching a series' OWN volume to itself would put two lanes on the same provider issues.
         if (series.metadataSource === metadataSource && series.metadataId === volumeId) {

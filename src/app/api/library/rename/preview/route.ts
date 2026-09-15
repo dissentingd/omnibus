@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { prisma } from '@/lib/db';
-import { filePatternForIssue } from '@/lib/utils/file-pattern';
+import { filePatternForIssue, seriesTokenForIssue } from '@/lib/utils/file-pattern';
 import path from 'path';
 import { getToken } from 'next-auth/jwt';
 import { Logger } from '@/lib/logger';
@@ -43,8 +43,9 @@ export async function POST(request: NextRequest) {
             // Fetch ALL issues for this series, then strictly filter for downloaded ones in memory
             const allIssues = await prisma.issue.findMany({
                 where: { seriesId: series.id },
-                // #203 COLLECTED: the preview must know the kind, or it promises the wrong name.
-                include: { attachedVolume: { select: { kind: true } } },
+                // #203 COLLECTED: the preview must know the kind — and, for a LOCAL edition, the
+                // source and name — or it promises the wrong name.
+                include: { attachedVolume: { select: { kind: true, metadataSource: true, name: true } } },
             });
 
             const downloadedIssues = allIssues
@@ -110,18 +111,27 @@ export async function POST(request: NextRequest) {
 
                 // The preview has to promise what the renamer will actually do, so it resolves
                 // the template through the same shared helper both renamers use.
+                const isCollected = (issue as any).attachedVolume?.kind === 'COLLECTED';
                 const patternForIssue = filePatternForIssue({
                     isAnnual: (issue as any).isAnnual,
-                    isCollected: (issue as any).attachedVolume?.kind === 'COLLECTED',
+                    isCollected,
                     isManga: series.isManga,
                     filePattern,
                     mangaFilePattern: activeMangaFilePattern,
                     collectedFilePattern: activeCollectedFilePattern,
                 });
+                // A LOCAL collected edition's books are promised under the edition's name, exactly
+                // as both renamers will produce it (same helper, same sanitizing as safeName).
+                const seriesToken = seriesTokenForIssue({
+                    isCollected,
+                    attachmentSource: (issue as any).attachedVolume?.metadataSource,
+                    attachmentName: (issue as any).attachedVolume?.name,
+                    seriesName: safeName,
+                }).replace(/[<>:"/\\|?*]/g, '').trim();
 
                 const newFileName = patternForIssue
                     .replace(/{Publisher}/gi, safePublisher)
-                    .replace(/{Series}/gi, safeName)
+                    .replace(/{Series}/gi, seriesToken)
                     .replace(/{Year}/gi, safeYear)
                     .replace(/{VolumeYear}/gi, safeYear)
                     .replace(/{IssueYear}/gi, issueYear)

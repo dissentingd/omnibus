@@ -165,4 +165,47 @@ describe('attachAsCollected', () => {
         expect(mocks.moveFileSafe).not.toHaveBeenCalled();
         expect(mocks.issueUpdate).not.toHaveBeenCalled();
     });
+
+    // A LOCAL collected edition — one ComicVine has no volume for: no provider lane, no skeletons, no
+    // engine. The files keep their own names (the name rule is the only thing that can ever claim
+    // them back after a wipe) and their rows become the lane's books outright.
+    describe('LOCAL (no provider volume)', () => {
+        const local = { ...input, metadataSource: 'LOCAL', volumeId: 'local_abc', volumeName: 'Saga Compendium' };
+
+        it('moves the folder under the owner without renaming, and makes its rows the lane books — no engine, no twins', async () => {
+            const result = await attachAsCollected(local);
+
+            expect(mocks.avUpsert).toHaveBeenCalledWith(expect.objectContaining({
+                create: expect.objectContaining({ seriesId: 's1', metadataSource: 'LOCAL', volumeId: 'local_abc', kind: 'COLLECTED', name: 'Saga Compendium' }),
+            }));
+            expect(mocks.engineFetchLong).not.toHaveBeenCalled();
+            expect(mocks.moveFileSafe).toHaveBeenCalledWith('/unmatched/Saga TPB/Saga v01.cbz', '/comics/Image/Saga (2012)/Saga v01.cbz');
+            expect(mocks.issueDelete).not.toHaveBeenCalled();
+            expect(mocks.issueUpdate).toHaveBeenCalledWith(expect.objectContaining({
+                where: { id: 'u1' },
+                data: expect.objectContaining({
+                    seriesId: 's1', attachedVolumeId: 'attX', metadataId: 'local_attX_1', metadataSource: 'LOCAL', matchState: 'MATCHED',
+                    name: 'Vol. 1', filePath: '/comics/Image/Saga (2012)/Saga v01.cbz', status: 'DOWNLOADED', isAnnual: false,
+                }),
+            }));
+            expect(mocks.seriesDelete).toHaveBeenCalledWith({ where: { id: 's_unm' } });
+            expect(result).toEqual(expect.objectContaining({ attachmentId: 'attX', moved: 1, absorbed: 1, claimed: 0, skeletonsReplaced: 0, conflicts: 0 }));
+        });
+
+        it('creates the lane book for a loose file', async () => {
+            vi.mocked(fs.promises.stat as any).mockResolvedValue({ isFile: () => true });
+
+            const result = await attachAsCollected({ ...local, source: '/unmatched/Saga Compendium 01.cbz', sourceSeriesId: null });
+
+            expect(mocks.moveFileSafe).toHaveBeenCalledWith('/unmatched/Saga Compendium 01.cbz', '/comics/Image/Saga (2012)/Saga Compendium 01.cbz');
+            expect(mocks.issueCreate).toHaveBeenCalledWith(expect.objectContaining({
+                data: expect.objectContaining({
+                    seriesId: 's1', attachedVolumeId: 'attX', number: '1', metadataId: 'local_attX_1', metadataSource: 'LOCAL', matchState: 'MATCHED',
+                    name: 'Vol. 1', filePath: '/comics/Image/Saga (2012)/Saga Compendium 01.cbz', status: 'DOWNLOADED',
+                }),
+            }));
+            expect(mocks.issueUpdate).not.toHaveBeenCalled();
+            expect(result).toEqual(expect.objectContaining({ moved: 1, claimed: 1, absorbed: 0 }));
+        });
+    });
 });

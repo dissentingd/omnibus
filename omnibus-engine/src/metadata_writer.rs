@@ -634,8 +634,12 @@ pub(crate) async fn write_series_json(db: &Db, series_id: &str) -> bool {
     for r in &attachment_rows {
         let attachment_id: String = r.try_get("id").unwrap_or_default();
         let kind: String = r.try_get::<String, _>("kind").unwrap_or_else(|_| "ANNUAL".to_string());
+        let source: String = r.try_get::<String, _>("metadataSource").unwrap_or_else(|_| "COMICVINE".to_string());
+        // #203 LOCAL: a local edition's books have no provider id — they are recorded by NUMBER,
+        // which is how the local sync finds them again after a wipe.
+        let is_local = source == "LOCAL";
         let mut entry = serde_json::json!({
-            "source": r.try_get::<String, _>("metadataSource").unwrap_or_else(|_| "COMICVINE".to_string()),
+            "source": source,
             "volume_id": r.try_get::<String, _>("volumeId").unwrap_or_default(),
             "kind": kind,
             "name": r.try_get::<Option<String>, _>("name").unwrap_or(None),
@@ -655,11 +659,15 @@ pub(crate) async fn write_series_json(db: &Db, series_id: &str) -> bool {
             .await
             .unwrap_or_default()
             .iter()
-            .map(|b| serde_json::json!({
-                "issue_id": b.try_get::<String, _>("metadataId").unwrap_or_default(),
-                "number": b.try_get::<String, _>("number").unwrap_or_default(),
-                "covers": b.try_get::<String, _>("coversIssues").unwrap_or_default(),
-            }))
+            .map(|b| {
+                let number: String = b.try_get::<String, _>("number").unwrap_or_default();
+                let issue_id = if is_local { format!("local:{}", number) } else { b.try_get::<String, _>("metadataId").unwrap_or_default() };
+                serde_json::json!({
+                    "issue_id": issue_id,
+                    "number": number,
+                    "covers": b.try_get::<String, _>("coversIssues").unwrap_or_default(),
+                })
+            })
             .collect();
             if !books.is_empty() {
                 entry["books"] = serde_json::Value::Array(books);
@@ -1045,7 +1053,7 @@ mod tests {
                 gtin TEXT, notes TEXT, "scanInformation" TEXT, review TEXT, "mainCharacterOrTeam" TEXT,
                 "alternateSeries" TEXT, "alternateNumber" TEXT, "alternateCount" INTEGER, "storyArcNumber" TEXT)"#,
             r#"CREATE TABLE "Issue" (id TEXT PRIMARY KEY, "seriesId" TEXT, "filePath" TEXT, number TEXT,
-                "isAnnual" INTEGER DEFAULT 0, "attachedVolumeId" TEXT, name TEXT, description TEXT,
+                "isAnnual" INTEGER DEFAULT 0, "attachedVolumeId" TEXT, "coversIssues" TEXT, name TEXT, description TEXT,
                 "releaseDate" TEXT, universe TEXT, genres TEXT, "storyArcs" TEXT,
                 writers TEXT, artists TEXT, characters TEXT, "coverArtists" TEXT, colorists TEXT,
                 letterers TEXT, teams TEXT, locations TEXT, inker TEXT, editor TEXT, translator TEXT,
@@ -1133,6 +1141,23 @@ mod tests {
         assert_eq!(annual["source"], "COMICVINE");
         assert_eq!(annual["kind"], "ANNUAL");
         assert_eq!(annual["start_year"], 2012);
+
+        // #203 LOCAL: a local edition's books are recorded by NUMBER ("local:1"), never by a
+        // provider id they don't have — that is what the local sync restores them from.
+        sqlx::query(
+            r#"INSERT INTO "AttachedVolume" (id, "seriesId", "metadataSource", "volumeId", kind, name, "startYear")
+               VALUES ('att_local', 's203', 'LOCAL', 'local_abc', 'COLLECTED', 'Court of Owls Compendium', NULL)"#,
+        ).execute(&db.pool).await.unwrap();
+        sqlx::query(
+            r#"INSERT INTO "Issue" (id, "seriesId", "filePath", number, "isAnnual", "attachedVolumeId", "metadataId", "metadataSource", "coversIssues")
+               VALUES ('i_local', 's203', NULL, '1', 0, 'att_local', 'local_att_local_1', 'LOCAL', '1-11')"#,
+        ).execute(&db.pool).await.unwrap();
+        assert!(write_series_json(&db, "s203").await, "series.json rewrites with the local edition");
+        let raw_l = std::fs::read_to_string(folder.join("series.json")).expect("series.json");
+        let parsed_l: serde_json::Value = serde_json::from_str(&raw_l).expect("valid json");
+        let local = parsed_l["omnibus"]["attached_volumes"].as_array().unwrap().iter().find(|a| a["source"] == "LOCAL").expect("the local edition");
+        assert_eq!(local["books"][0]["issue_id"], "local:1");
+        assert_eq!(local["books"][0]["covers"], "1-11");
 
         let _ = std::fs::remove_dir_all(&base);
     }

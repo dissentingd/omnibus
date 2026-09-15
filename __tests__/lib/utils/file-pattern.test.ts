@@ -3,7 +3,7 @@
 // with both: a preview that promises a name the renamer doesn't produce is a bug that already
 // shipped once (annuals, caught in the beta.007 walk).
 import { describe, it, expect } from 'vitest';
-import { filePatternForIssue, ANNUAL_FILE_PATTERN, COLLECTED_FILE_PATTERN } from '@/lib/utils/file-pattern';
+import { filePatternForIssue, seriesTokenForIssue, ANNUAL_FILE_PATTERN, COLLECTED_FILE_PATTERN } from '@/lib/utils/file-pattern';
 
 const comic = '{Series} #{Issue}';
 const manga = '{Series} Vol. {Issue}';
@@ -38,5 +38,39 @@ describe('filePatternForIssue', () => {
     it('matches the engine constants exactly (twin drift guard)', () => {
         expect(ANNUAL_FILE_PATTERN).toBe('{Series} Annual #{Issue} ({IssueYear})');
         expect(COLLECTED_FILE_PATTERN).toBe('{Series} Vol. {Issue} ({IssueYear})');
+    });
+});
+
+// A LOCAL collected edition (one the provider has no volume for) is claimed by its files' NAMES
+// alone — the beta.018 name rule — so its books must be named after the edition, not the parent
+// series: "Batman Compendium Vol. 001", never "Batman Vol. 001", or the next wipe orphans them
+// (and the file parses as run #1). Twin: renamer.rs `series_token_for_issue`.
+describe('seriesTokenForIssue', () => {
+    it('names a LOCAL collected book after its edition', () => {
+        expect(seriesTokenForIssue({
+            isCollected: true, attachmentSource: 'LOCAL', attachmentName: 'Batman Compendium', seriesName: 'Batman',
+        })).toBe('Batman Compendium');
+        // Trimmed, so a padded name never leaks whitespace into the filename.
+        expect(seriesTokenForIssue({
+            isCollected: true, attachmentSource: 'LOCAL', attachmentName: '  Batman Compendium ', seriesName: 'Batman',
+        })).toBe('Batman Compendium');
+    });
+
+    it('keeps the series name for provider-backed books, whose claim is the issue id', () => {
+        expect(seriesTokenForIssue({
+            isCollected: true, attachmentSource: 'COMICVINE', attachmentName: 'Batman: The Deluxe Edition', seriesName: 'Batman',
+        })).toBe('Batman');
+        expect(seriesTokenForIssue({
+            isCollected: true, attachmentSource: 'METRON', attachmentName: 'Batman TPB', seriesName: 'Batman',
+        })).toBe('Batman');
+    });
+
+    it('keeps the series name when there is nothing to name after, or the row is not a collected book', () => {
+        // A blank edition name is not a name.
+        expect(seriesTokenForIssue({ isCollected: true, attachmentSource: 'LOCAL', attachmentName: '  ', seriesName: 'Batman' })).toBe('Batman');
+        expect(seriesTokenForIssue({ isCollected: true, attachmentSource: 'LOCAL', attachmentName: null, seriesName: 'Batman' })).toBe('Batman');
+        // Only collected books take the edition's name; a plain issue or an annual never does.
+        expect(seriesTokenForIssue({ isCollected: false, attachmentSource: 'LOCAL', attachmentName: 'Batman Compendium', seriesName: 'Batman' })).toBe('Batman');
+        expect(seriesTokenForIssue({ seriesName: 'Batman' })).toBe('Batman');
     });
 });

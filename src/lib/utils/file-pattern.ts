@@ -34,3 +34,23 @@ export function filePatternForIssue(opts: {
     if (isManga && mangaFilePattern && mangaFilePattern.trim()) return mangaFilePattern;
     return filePattern;
 }
+
+/** What `{Series}` means in one issue's FILE name. EXACT TWIN of renamer.rs `series_token_for_issue`.
+ *
+ *  A LOCAL collected edition — a trade the provider has no volume for — is claimed by its files'
+ *  NAMES alone (the name-anchored rule, attachment-name.ts): there is no issue id in a ComicInfo
+ *  to fall back on. So its books are named after the EDITION ("Batman Compendium Vol. 001"), which
+ *  the name rule still finds as the filename's prefix; naming them after the series ("Batman Vol.
+ *  001") would orphan them at the next wipe, where they would parse as the run's #1. Every other
+ *  row — a plain issue, an annual, a provider-backed trade — names after the series as before. */
+export function seriesTokenForIssue(opts: {
+    isCollected?: boolean;
+    attachmentSource?: string | null;
+    attachmentName?: string | null;
+    seriesName: string;
+}): string {
+    const { isCollected, attachmentSource, attachmentName, seriesName } = opts;
+    const edition = (attachmentName || '').trim();
+    if (isCollected && attachmentSource === 'LOCAL' && edition) return edition;
+    return seriesName;
+}

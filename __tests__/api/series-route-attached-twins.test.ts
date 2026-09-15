@@ -149,4 +149,28 @@ describe('#203 beta.010 regression: attached-lane rows vs. the folder file sync'
         expect(prisma.issue.update).not.toHaveBeenCalled();
         expect(deletedIds()).toEqual([]);
     });
+
+    // A LOCAL collected edition has no engine lane to claim its files, so a new file whose name says
+    // it belongs to one is bound to it HERE, outright — a provider lane's file is still created
+    // unbound for the engine's id-anchored claim (unchanged).
+    it('binds a new file to a LOCAL lane by name, while a provider lane file stays for the engine to claim', async () => {
+        (prisma.attachedVolume.findMany as any).mockResolvedValue([
+            { id: 'attLocal', name: 'Batman: The Court of Owls', kind: 'COLLECTED', metadataSource: 'LOCAL' },
+            { id: 'attCv', name: 'Batman Annual', kind: 'ANNUAL', metadataSource: 'COMICVINE' },
+        ]);
+        (prisma.issue.findMany as any).mockResolvedValue([]);
+        disk.files = ['Batman The Court of Owls 01.cbz', 'Batman Annual 001 (2012).cbz'];
+
+        await GET(getReq(`http://localhost/api/library/series?path=${encodeURIComponent(FOLDER)}`));
+
+        const rows = created();
+        const localBook = rows.find((r: any) => String(r.filePath).includes('Court of Owls'));
+        const annual = rows.find((r: any) => String(r.filePath).includes('Annual 001'));
+        expect(localBook).toEqual(expect.objectContaining({
+            attachedVolumeId: 'attLocal', number: '1', isAnnual: false, metadataSource: 'LOCAL', matchState: 'MATCHED', name: 'Vol. 1', status: 'DOWNLOADED',
+        }));
+        expect(String(localBook.metadataId)).toMatch(/^local_attLocal_1$/);
+        expect(annual).toEqual(expect.objectContaining({ number: '1', isAnnual: true, matchState: 'UNMATCHED' }));
+        expect(annual.attachedVolumeId).toBeUndefined();
+    });
 });

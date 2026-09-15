@@ -139,6 +139,10 @@ async fn sync_attachment(db: &Db, client: &Client, attachment_id: &str, claim: b
     let source: String = row.try_get("metadataSource").unwrap_or_else(|_| "COMICVINE".to_string());
     let volume_id: String = row.get("volumeId");
     let kind: String = row.try_get("kind").unwrap_or_else(|_| "ANNUAL".to_string());
+    // #203 LOCAL: no provider volume to fetch — the pass is the name claim plus series.json coverage.
+    if source == "LOCAL" {
+        return sync_local_attachment(db, attachment_id, &series_id, &kind).await;
+    }
     // #203 COLLECTED: the lane serves both kinds now, so isAnnual follows the ATTACHMENT's kind —
     // a trade is not an annual, and flagging it as one would put it in the annual numbering domain,
     // label it "Annual #N" in every view, and sort it among comics it merely reprints. Written as a
@@ -483,6 +487,130 @@ async fn find_claim_candidate(db: &Db, series_id: &str, number: &str) -> anyhow:
         let n: String = r.try_get("number").unwrap_or_default();
         is_same_issue(&n, number)
     }))
+}
+
+/// #203 LOCAL (field report by robotshavehearts2): a collected edition — or an annual run — the
+/// provider has no volume for. There is nothing to fetch: its books are this series' file-backed
+/// rows whose FILENAMES carry the attachment's name (the beta.018 rule), bound here — the Node
+/// reconciler binds brand-new files the same way — and their coverage comes back from series.json
+/// by number after a wipe (the writer records a local edition's books as "local:<number>").
+async fn sync_local_attachment(db: &Db, attachment_id: &str, series_id: &str, kind: &str) -> anyhow::Result<AttachSummary> {
+    let (series_name, series_folder, att_name, att_volume_id): (String, String, Option<String>, String) = sqlx::query(
+        r#"SELECT s.name AS sname, s."folderPath" AS sfolder, a.name AS aname, a."volumeId" AS avol
+           FROM "AttachedVolume" a JOIN "Series" s ON s.id = a."seriesId" WHERE a.id = $1"#,
+    )
+    .bind(attachment_id)
+    .fetch_optional(&db.pool)
+    .await?
+    .map(|r| (
+        r.try_get::<String, _>("sname").unwrap_or_default(),
+        r.try_get::<Option<String>, _>("sfolder").unwrap_or(None).unwrap_or_default(),
+        r.try_get::<Option<String>, _>("aname").unwrap_or(None),
+        r.try_get::<String, _>("avol").unwrap_or_default(),
+    ))
+    .unwrap_or_default();
+    let annual_lit = if kind == "ANNUAL" { "true" } else { "false" };
+
+    let name_refs: Vec<AttachmentNameRef> = sqlx::query(r#"SELECT id, name, kind FROM "AttachedVolume" WHERE "seriesId" = $1"#)
+        .bind(series_id)
+        .fetch_all(&db.pool)
+        .await?
+        .into_iter()
+        .map(|r| AttachmentNameRef {
+            id: r.get("id"),
+            name: r.try_get::<Option<String>, _>("name").unwrap_or(None).unwrap_or_default(),
+            kind: r.try_get("kind").unwrap_or_else(|_| "ANNUAL".to_string()),
+        })
+        .collect();
+
+    // series.json's memory of this edition's books, by number ("local:<n>" → covers).
+    let sj_books: std::collections::HashMap<String, String> = if kind == "COLLECTED" && !series_folder.is_empty() {
+        let folder = series_folder.clone();
+        let vol = att_volume_id.clone();
+        tokio::task::spawn_blocking(move || crate::scanner::read_series_json(std::path::Path::new(&folder)))
+            .await
+            .ok()
+            .flatten()
+            .map(|sj| sj.attached_volumes.into_iter()
+                .filter(|a| a.source == "LOCAL" && a.volume_id == vol)
+                .flat_map(|a| a.books)
+                .collect())
+            .unwrap_or_default()
+    } else {
+        std::collections::HashMap::new()
+    };
+    let sj_covers = |number: &str| sj_books.get(&format!("local:{}", number)).map(|s| s.as_str());
+
+    let mut summary = AttachSummary { attachment_id: attachment_id.to_string(), name: att_name.clone(), ..Default::default() };
+
+    // 1. The claim: unbound file-backed rows whose filename names this edition. The row keeps its
+    //    number as parsed under the edition's name, takes a lane-and-number identity that survives
+    //    a wipe, a "Vol. N" title unless it already has a real one, and any remembered coverage.
+    let candidates = sqlx::query(
+        r#"SELECT id, "filePath", "coversIssues" FROM "Issue"
+           WHERE "seriesId" = $1 AND "attachedVolumeId" IS NULL AND "filePath" IS NOT NULL AND "filePath" <> ''"#,
+    )
+    .bind(series_id)
+    .fetch_all(&db.pool)
+    .await?;
+    for r in &candidates {
+        let file: String = r.get("filePath");
+        let base = std::path::Path::new(&file).file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+        let Some(m) = attachment_for_filename(&base, &series_name, &name_refs) else { continue };
+        if m.id != attachment_id { continue; }
+        let row_id: String = r.get("id");
+        let existing_covers: Option<String> = r.try_get("coversIssues").unwrap_or(None);
+        let covers_fill = crate::coverage::coverage_fill_for(kind, existing_covers.as_deref(), sj_covers(&m.number), None, None, false);
+        let local_id = format!("local_{}_{}", attachment_id, m.number);
+        let vol_name = format!("Vol. {}", m.number);
+        sqlx::query(&format!(
+            r#"UPDATE "Issue" SET "attachedVolumeId"=$1, "isAnnual"={annual}, "matchState"='MATCHED', "metadataId"=$2, "metadataSource"='LOCAL',
+               number=$3, name=CASE WHEN name IS NULL OR name = '' OR name LIKE 'Issue %' THEN $4 ELSE name END,
+               "coversIssues"=COALESCE(NULLIF("coversIssues", ''), $5) WHERE id=$6"#,
+            annual = annual_lit
+        ))
+        .bind(attachment_id)
+        .bind(&local_id)
+        .bind(&m.number)
+        .bind(&vol_name)
+        .bind(&covers_fill)
+        .bind(&row_id)
+        .execute(&db.pool)
+        .await?;
+        summary.claimed += 1;
+    }
+
+    // 2. Books already in the lane: coverage restored fill-blank from series.json.
+    let bound = sqlx::query(r#"SELECT id, number, "coversIssues" FROM "Issue" WHERE "attachedVolumeId" = $1"#)
+        .bind(attachment_id)
+        .fetch_all(&db.pool)
+        .await?;
+    for r in &bound {
+        let number: String = r.get("number");
+        let existing: Option<String> = r.try_get("coversIssues").unwrap_or(None);
+        if let Some(fill) = crate::coverage::coverage_fill_for(kind, existing.as_deref(), sj_covers(&number), None, None, false) {
+            let id: String = r.get("id");
+            sqlx::query(r#"UPDATE "Issue" SET "coversIssues"=$1 WHERE id=$2"#).bind(&fill).bind(&id).execute(&db.pool).await?;
+            summary.updated += 1;
+        }
+    }
+    summary.total = bound.len() as i64;
+
+    let _ = sqlx::query(&format!(
+        r#"UPDATE "AttachedVolume" SET "issueCount"=$1, "lastSyncedAt"={now_utc}, "updatedAt"={now} WHERE id=$2"#,
+        now_utc = db.now_utc_ts_expr(),
+        now = db.now_expr()
+    ))
+    .bind(summary.total)
+    .bind(attachment_id)
+    .execute(&db.pool)
+    .await;
+
+    log::info!(
+        "[Attached] LOCAL \"{}\" on series {}: claimed {} file(s) by name, {} coverage value(s) restored, {} book(s) in the lane.",
+        att_name.clone().unwrap_or_else(|| attachment_id.to_string()), series_id, summary.claimed, summary.updated, summary.total
+    );
+    Ok(summary)
 }
 
 /// One attached volume as the name-anchoring rule sees it.
@@ -864,6 +992,65 @@ mod tests {
         assert!(find_claim_candidate(&db, "s1", "2").await.expect("query ok").is_none());
         // Zero-padding is the same number (is_same_issue), so an "003" row still answers to "3".
         assert!(find_claim_candidate(&db, "s1", "003").await.expect("query ok").is_some());
+    }
+
+    /// The LOCAL sync reads the series (name, folder) too, and restores coverage from a real
+    /// series.json in that folder — so this fixture carries a Series table and a temp folder.
+    async fn fixture_local(tag: &str) -> (Db, std::path::PathBuf) {
+        let base = std::env::temp_dir().join(format!("omnibus_avl_{}_{}", tag, std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).expect("create fixture dir");
+        let db_file = base.join("avl.db");
+        std::fs::File::create(&db_file).expect("pre-create sqlite file");
+        let db_url = format!("file:{}", db_file.to_string_lossy().replace('\\', "/"));
+        let db = Db::connect(&db_url, 2).await.expect("connect file-backed sqlite");
+        for ddl in [
+            r#"CREATE TABLE "Series" (id TEXT PRIMARY KEY, name TEXT, "folderPath" TEXT)"#,
+            r#"CREATE TABLE "Issue" (id TEXT PRIMARY KEY, "seriesId" TEXT, number TEXT, "isAnnual" INTEGER DEFAULT 0,
+                "attachedVolumeId" TEXT, "metadataId" TEXT, "metadataSource" TEXT, "filePath" TEXT, status TEXT,
+                name TEXT, "matchState" TEXT, "coversIssues" TEXT)"#,
+            r#"CREATE TABLE "AttachedVolume" (id TEXT PRIMARY KEY, "seriesId" TEXT, "metadataSource" TEXT,
+                "volumeId" TEXT, kind TEXT, name TEXT, "startYear" INTEGER, "issueCount" INTEGER DEFAULT 0,
+                "lastSyncedAt" TEXT, "createdAt" TEXT, "updatedAt" TEXT)"#,
+        ] {
+            sqlx::query(ddl).execute(&db.pool).await.expect("create schema");
+        }
+        (db, base)
+    }
+
+    // #203 LOCAL: a collected edition the provider has no volume for.
+    #[tokio::test]
+    async fn local_sync_claims_files_by_name_and_restores_coverage_from_series_json() {
+        let (db, folder) = fixture_local("local").await;
+        std::fs::write(
+            folder.join("series.json"),
+            r#"{"version":"1.0.2","metadata":{"type":"comicSeries","name":"Saga"},"omnibus":{"attached_volumes":[
+                {"source":"LOCAL","volume_id":"local_abc","kind":"COLLECTED","name":"Saga Compendium",
+                 "books":[{"issue_id":"local:1","number":"1","covers":"1-54"}]}]}}"#,
+        ).unwrap();
+        let folder_str = folder.to_string_lossy().replace('\\', "/");
+        sqlx::query(r#"INSERT INTO "Series" (id, name, "folderPath") VALUES ('s1', 'Saga', $1)"#).bind(&folder_str).execute(&db.pool).await.unwrap();
+        sqlx::query(r#"INSERT INTO "AttachedVolume" (id, "seriesId", "metadataSource", "volumeId", kind, name) VALUES ('att_local', 's1', 'LOCAL', 'local_abc', 'COLLECTED', 'Saga Compendium')"#).execute(&db.pool).await.unwrap();
+        // The scan's view after a wipe: the compendium file indexed as an unmatched main-run #1, beside the real #1.
+        insert_issue(&db, "book", "1", false, Some("/c/Saga/Saga Compendium 01.cbz"), None, Some("unmatched_x")).await;
+        insert_issue(&db, "main1", "1", false, Some("/c/Saga/Saga 001.cbz"), None, Some("300001")).await;
+
+        let summary = sync_local_attachment(&db, "att_local", "s1", "COLLECTED").await.unwrap();
+        assert_eq!((summary.claimed, summary.updated, summary.total), (1, 0, 1));
+
+        let row = sqlx::query(r#"SELECT "attachedVolumeId", "metadataId", "matchState", "coversIssues", name, number FROM "Issue" WHERE id = 'book'"#).fetch_one(&db.pool).await.unwrap();
+        assert_eq!(row.get::<Option<String>, _>("attachedVolumeId"), Some("att_local".to_string()));
+        assert_eq!(row.get::<String, _>("metadataId"), "local_att_local_1");
+        assert_eq!(row.get::<String, _>("matchState"), "MATCHED");
+        assert_eq!(row.get::<Option<String>, _>("coversIssues"), Some("1-54".to_string()), "coverage comes back from series.json by number");
+        assert_eq!(row.get::<Option<String>, _>("name"), Some("Vol. 1".to_string()));
+        // The run's own #1 is nobody's book.
+        let main = sqlx::query(r#"SELECT "attachedVolumeId" FROM "Issue" WHERE id = 'main1'"#).fetch_one(&db.pool).await.unwrap();
+        assert!(main.get::<Option<String>, _>("attachedVolumeId").is_none());
+        // Idempotent: a second pass claims nothing new and restores nothing twice.
+        let again = sync_local_attachment(&db, "att_local", "s1", "COLLECTED").await.unwrap();
+        assert_eq!((again.claimed, again.updated, again.total), (0, 0, 1));
+        let _ = std::fs::remove_dir_all(&folder);
     }
 
     #[tokio::test]

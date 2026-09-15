@@ -13,10 +13,15 @@ vi.mock('@/app/api/auth/[...nextauth]/options', () => ({ getAuthOptions: vi.fn(a
 vi.mock('@/lib/db', () => ({
     prisma: {
         series: { findUnique: vi.fn(), findFirst: vi.fn(), delete: vi.fn() },
-        attachedVolume: { findMany: vi.fn(), findUnique: vi.fn(), upsert: vi.fn(), delete: vi.fn() },
+        attachedVolume: { findMany: vi.fn(), findUnique: vi.fn(), findFirst: vi.fn(), upsert: vi.fn(), delete: vi.fn() },
         issue: { groupBy: vi.fn(), findMany: vi.fn(), updateMany: vi.fn(), deleteMany: vi.fn(), update: vi.fn(), delete: vi.fn(), count: vi.fn() },
+        library: { findMany: vi.fn(async () => [{ id: 'lib1', path: '/comics' }]) },
     }
 }));
+// LOCAL attachments with a sourcePath hand the move to the collision helper; the route is tested
+// for what it asks of it, the helper for what it does.
+vi.mock('@/lib/match-collision', () => ({ attachAsCollected: vi.fn() }));
+vi.mock('fs', () => ({ default: { existsSync: vi.fn(() => true) } }));
 
 vi.mock('@/lib/engine', () => ({
     ENGINE_URL: 'http://engine',
@@ -209,5 +214,71 @@ describe('API: attachments — absorbing a standalone series (PUT)', () => {
         // Reporting only — nothing has been moved or deleted.
         expect(prisma.issue.update).not.toHaveBeenCalled();
         expect(prisma.series.delete).not.toHaveBeenCalled();
+    });
+});
+
+// A collected edition ComicVine has no volume for (field report by robotshavehearts2): a LOCAL
+// attachment with a typed name. No provider lane — its books are the files whose names carry it.
+describe('API: attachments — LOCAL (no provider volume)', () => {
+    beforeEach(() => {
+        vi.clearAllMocks();
+        process.env.OMNIBUS_AWAITING_MATCH_DIR = '/unmatched';
+        (getServerSession as any).mockResolvedValue({ user: { id: 'admin1', role: 'ADMIN' } });
+        (prisma.series.findUnique as any).mockResolvedValue({
+            id: 's1', name: 'Saga', year: 2012, publisher: 'Image', metadataSource: 'COMICVINE', metadataId: '49976', folderPath: '/comics/Image/Saga (2012)', isManga: false,
+        });
+        (prisma.attachedVolume.findFirst as any).mockResolvedValue(null);
+        (prisma.attachedVolume.upsert as any).mockImplementation(async ({ where, create }: any) => ({
+            id: where.seriesId_metadataSource_volumeId.volumeId === 'local_old' ? 'attExisting' : 'attL', ...create,
+        }));
+        (prisma.series.findFirst as any).mockResolvedValue(null);
+        (engineFetchLong as any).mockResolvedValue(engineOk({ attachment_id: 'attL', name: 'Saga Compendium', total: 1, claimed: 1, created: 0, updated: 0, unclaimed: 0 }));
+    });
+
+    it('creates the attachment under a local id and has the engine claim its files by name', async () => {
+        const res = await POST(createReq({ seriesId: 's1', metadataSource: 'LOCAL', kind: 'COLLECTED', name: '  Saga Compendium  ' }));
+        const data = await res.json();
+
+        expect(res.status).toBe(200);
+        expect(prisma.attachedVolume.upsert).toHaveBeenCalledWith(expect.objectContaining({
+            create: expect.objectContaining({ seriesId: 's1', metadataSource: 'LOCAL', kind: 'COLLECTED', name: 'Saga Compendium', volumeId: expect.stringMatching(/^local_/) }),
+        }));
+        expect(engineFetchLong).toHaveBeenCalledWith('http://engine/api/metadata/attach-sync', expect.objectContaining({ body: JSON.stringify({ attachment_id: 'attL', claim: true }) }));
+        expect(data).toEqual(expect.objectContaining({ success: true, local: true, attachmentId: 'attL', name: 'Saga Compendium' }));
+        // No provider id, so no standalone-series lookup either.
+        expect(prisma.series.findFirst).not.toHaveBeenCalled();
+    });
+
+    it('needs a name, and reuses a local attachment of the same name on the series', async () => {
+        expect((await POST(createReq({ seriesId: 's1', metadataSource: 'LOCAL', kind: 'COLLECTED' }))).status).toBe(400);
+        expect((await POST(createReq({ seriesId: 's1', metadataSource: 'LOCAL', kind: 'COLLECTED', name: '   ' }))).status).toBe(400);
+
+        (prisma.attachedVolume.findFirst as any).mockResolvedValue({ id: 'attExisting', volumeId: 'local_old', name: 'Saga Compendium' });
+        const data = await (await POST(createReq({ seriesId: 's1', metadataSource: 'LOCAL', kind: 'COLLECTED', name: 'Saga Compendium' }))).json();
+        expect(data.attachmentId).toBe('attExisting');
+        expect(prisma.attachedVolume.upsert).toHaveBeenCalledWith(expect.objectContaining({
+            where: { seriesId_metadataSource_volumeId: { seriesId: 's1', metadataSource: 'LOCAL', volumeId: 'local_old' } },
+        }));
+    });
+
+    it('with a sourcePath, moves the dropped folder under the series through the collision helper instead of the engine', async () => {
+        const { attachAsCollected } = await import('@/lib/match-collision');
+        (attachAsCollected as any).mockResolvedValue({ attachmentId: 'attL', moved: 1, absorbed: 1, claimed: 0, skeletonsReplaced: 0, conflicts: 0 });
+
+        const res = await POST(createReq({ seriesId: 's1', metadataSource: 'LOCAL', kind: 'COLLECTED', name: 'Saga Compendium', sourcePath: '/unmatched/Saga Compendium' }));
+        const data = await res.json();
+
+        expect(res.status).toBe(200);
+        expect(attachAsCollected).toHaveBeenCalledWith(expect.objectContaining({
+            owner: expect.objectContaining({ id: 's1', name: 'Saga', folderPath: '/comics/Image/Saga (2012)' }),
+            source: '/unmatched/Saga Compendium', metadataSource: 'LOCAL', volumeId: expect.stringMatching(/^local_/), volumeName: 'Saga Compendium',
+        }));
+        expect(engineFetchLong).not.toHaveBeenCalled();
+        expect(data).toEqual(expect.objectContaining({ success: true, local: true, moved: 1, absorbed: 1, conflicts: 0 }));
+    });
+
+    it('refuses a sourcePath outside the library roots and the drop folder', async () => {
+        const res = await POST(createReq({ seriesId: 's1', metadataSource: 'LOCAL', kind: 'COLLECTED', name: 'Saga Compendium', sourcePath: '/etc/passwd' }));
+        expect(res.status).toBe(403);
     });
 });

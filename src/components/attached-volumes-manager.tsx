@@ -140,6 +140,8 @@ export function AttachedVolumesManager({
     const [hasSearched, setHasSearched] = useState(false)
     const [exactId, setExactId] = useState("")
     const [attachingId, setAttachingId] = useState<string | null>(null)
+    // #203 LOCAL: a collected edition the provider has no volume for — attached by name alone.
+    const [localName, setLocalName] = useState("")
 
     const [busyId, setBusyId] = useState<string | null>(null)
     // #203 COLLECTED: the attached volume turned out to already live in the library as its own
@@ -170,7 +172,37 @@ export function AttachedVolumesManager({
         setResults([])
         setHasSearched(false)
         setExactId("")
+        setLocalName("")
         setDialogOpen(true)
+    }
+
+    /** A local edition: no provider volume, no sync — the files in this folder whose names carry it are its books. */
+    const attachLocal = async () => {
+        const name = localName.trim()
+        if (!name) return
+        setAttachingId("local")
+        try {
+            const res = await fetch(`/api/library/series/attachments`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ seriesId, metadataSource: "LOCAL", kind, name }),
+            })
+            const data = await res.json()
+            if (!res.ok || !data.success) throw new Error(data.error || "Couldn't add it")
+            toast({
+                title: `Attached ${data.name || name}`,
+                description: data.summary && data.summary.claimed > 0
+                    ? `${data.summary.claimed} file${data.summary.claimed === 1 ? "" : "s"} in this folder carry that name and joined it. Set what each book covers below.`
+                    : "Added. Files in this series' folder whose names start with that name become its books — drop them in and refresh the series.",
+            })
+            setDialogOpen(false)
+            await load()
+            onChanged?.()
+        } catch (e: any) {
+            toast({ title: "Couldn't add that edition", description: e.message, variant: "destructive" })
+        } finally {
+            setAttachingId(null)
+        }
     }
 
     const runSearch = async () => {
@@ -331,19 +363,24 @@ export function AttachedVolumesManager({
                                     {a.startYear ? <span className="text-muted-foreground font-normal"> ({a.startYear})</span> : null}
                                 </p>
                                 <p className="text-xs text-muted-foreground font-mono">
-                                    {a.metadataSource} {a.volumeId} · {a.ownedCount} of {a.issueCount} owned
+                                    {a.metadataSource === "LOCAL"
+                                        // A local edition has no provider id and no lane to be "of": its books are the files that carry its name.
+                                        ? <>Local · {a.ownedCount} owned</>
+                                        : <>{a.metadataSource} {a.volumeId} · {a.ownedCount} of {a.issueCount} owned</>}
                                 </p>
                             </div>
                             <div className="flex items-center gap-2 shrink-0">
-                                <Button
-                                    size="sm"
-                                    variant="secondary"
-                                    className="h-8 px-3 text-xs font-bold"
-                                    disabled={busyId === a.id}
-                                    onClick={() => refresh(a)}
-                                >
-                                    {busyId === a.id ? <Loader2 className="w-4 h-4 animate-spin" /> : <><RefreshCw className="w-4 h-4 sm:mr-1" /><span className="hidden sm:inline">Refresh</span></>}
-                                </Button>
+                                {a.metadataSource !== "LOCAL" && (
+                                    <Button
+                                        size="sm"
+                                        variant="secondary"
+                                        className="h-8 px-3 text-xs font-bold"
+                                        disabled={busyId === a.id}
+                                        onClick={() => refresh(a)}
+                                    >
+                                        {busyId === a.id ? <Loader2 className="w-4 h-4 animate-spin" /> : <><RefreshCw className="w-4 h-4 sm:mr-1" /><span className="hidden sm:inline">Refresh</span></>}
+                                    </Button>
+                                )}
                                 <Button
                                     size="sm"
                                     variant="outline"
@@ -465,6 +502,36 @@ export function AttachedVolumesManager({
                                 ComicVine volume IDs are the number after <span className="font-mono">4050-</span> in the volume&apos;s URL.
                             </p>
                         </div>
+
+                        {kind === "COLLECTED" && (
+                            <div className="border-t border-border pt-4 space-y-2">
+                                <Label htmlFor="local-collected-name" className="text-xs font-bold text-foreground">
+                                    Not on the provider? Add it by name
+                                </Label>
+                                <div className="flex items-center gap-2">
+                                    <Input
+                                        id="local-collected-name"
+                                        aria-label="Name of the collected edition"
+                                        value={localName}
+                                        onChange={e => setLocalName(e.target.value)}
+                                        onKeyDown={e => { if (e.key === "Enter") { e.preventDefault(); attachLocal() } }}
+                                        placeholder="e.g. Saga Compendium One"
+                                        className="bg-background border-border"
+                                    />
+                                    <Button
+                                        variant="secondary"
+                                        className="font-bold shrink-0"
+                                        disabled={!localName.trim() || attachingId !== null}
+                                        onClick={attachLocal}
+                                    >
+                                        {attachingId === "local" ? <Loader2 className="w-4 h-4 animate-spin" /> : "Add it by name"}
+                                    </Button>
+                                </div>
+                                <p className="text-xs text-muted-foreground">
+                                    For a trade or omnibus the provider simply doesn&apos;t have. No provider link: the files in this folder whose names start with that name are its books, and what each covers is set on the shelf.
+                                </p>
+                            </div>
+                        )}
                     </div>
                 </DialogContent>
             </Dialog>

@@ -109,6 +109,10 @@ const COMIC_EXT = /\.(cbz|cbr|cb7|zip|rar|pdf|epub)$/i;
 export async function attachAsCollected(input: AttachAsCollectedInput): Promise<AttachAsCollectedResult> {
     const { owner, source, sourceSeriesId, metadataSource, volumeId, volumeName, volumeYear, config, libraryRoots } = input;
     const result: AttachAsCollectedResult = { moved: 0, absorbed: 0, claimed: 0, skeletonsReplaced: 0, conflicts: 0 };
+    // A LOCAL collected edition — one the provider has no volume for — has no lane to fetch, no
+    // skeletons to replace, and keeps its files' own names: the name rule (beta.018) is the only
+    // thing that can ever claim them back after a wipe, and a rename would erase that.
+    const isLocal = metadataSource === 'LOCAL';
 
     // 1. The attachment (idempotent: re-running re-syncs).
     const attachment = await prisma.attachedVolume.upsert({
@@ -119,25 +123,27 @@ export async function attachAsCollected(input: AttachAsCollectedInput): Promise<
     result.attachmentId = attachment.id;
 
     // 2. The engine imports the volume's books as the lane's skeletons. Without that there is
-    //    nothing to take the place of, so nothing is moved.
-    try {
-        const res = await engineFetchLong(ENGINE_URL + '/api/metadata/attach-sync', {
-            method: 'POST',
-            headers: engineHeaders({ 'Content-Type': 'application/json' }),
-            body: JSON.stringify({ attachment_id: attachment.id, claim: true }),
-        });
-        const payload = await res.json().catch(() => null);
-        if (!res.ok || !payload?.ok) {
-            result.error = payload?.error || `engine returned ${res.status}`;
+    //    nothing to take the place of, so nothing is moved. (A local edition has none to import.)
+    if (!isLocal) {
+        try {
+            const res = await engineFetchLong(ENGINE_URL + '/api/metadata/attach-sync', {
+                method: 'POST',
+                headers: engineHeaders({ 'Content-Type': 'application/json' }),
+                body: JSON.stringify({ attachment_id: attachment.id, claim: true }),
+            });
+            const payload = await res.json().catch(() => null);
+            if (!res.ok || !payload?.ok) {
+                result.error = payload?.error || `engine returned ${res.status}`;
+                return result;
+            }
+        } catch (e) {
+            Logger.log(`[Match Collision] Engine unreachable for the collected import: ${getErrorMessage(e)}`, 'error');
+            result.error = 'The engine is unreachable.';
             return result;
         }
-    } catch (e) {
-        Logger.log(`[Match Collision] Engine unreachable for the collected import: ${getErrorMessage(e)}`, 'error');
-        result.error = 'The engine is unreachable.';
-        return result;
     }
 
-    const lane = await prisma.issue.findMany({
+    const lane = isLocal ? [] : await prisma.issue.findMany({
         where: { attachedVolumeId: attachment.id },
         select: { id: true, number: true, filePath: true, metadataId: true, metadataSource: true, name: true, coverUrl: true, releaseDate: true, description: true, coversIssues: true },
     });
@@ -181,7 +187,7 @@ export async function attachAsCollected(input: AttachAsCollectedInput): Promise<
         const twin = twinFor(number);
         const padded = !number.includes('.') && number.length === 1 ? `0${number}` : number;
         const issueYear = (twin?.releaseDate || '').slice(0, 4) || (volumeYear ? String(volumeYear) : '');
-        const newName = pattern
+        const newName = isLocal ? base : pattern
             .replace(/{Publisher}/gi, safePublisher)
             .replace(/{Series}/gi, safeSeries)
             .replace(/{Year}/gi, owner.year ? String(owner.year) : '')
@@ -190,6 +196,8 @@ export async function attachAsCollected(input: AttachAsCollectedInput): Promise<
             .replace(/{Issue}/gi, padded)
             .replace(/\(\s*\)/g, '').replace(/\[\s*\]/g, '').replace(/\s+/g, ' ').trim() + ext;
         const target = `${ownerFolder}/${newName}`;
+        // A local book's identity is its lane and number — stable across a wipe, unlike a row id.
+        const localIdentity = { metadataId: `local_${attachment.id}_${number}`, metadataSource: 'LOCAL', matchState: 'MATCHED', name: `Vol. ${number}` };
 
         // A different file already at the destination is never overwritten — this one stays put,
         // row, folder and all, and is counted so the caller can say so.
@@ -213,6 +221,7 @@ export async function attachAsCollected(input: AttachAsCollectedInput): Promise<
                 where: { id: item.row.id },
                 data: {
                     seriesId: owner.id, attachedVolumeId: attachment.id, filePath: target, status: 'DOWNLOADED', isAnnual: false,
+                    ...(isLocal ? localIdentity : {}),
                     ...(twin ? {
                         metadataId: twin.metadataId, metadataSource: twin.metadataSource, matchState: 'MATCHED',
                         ...(twin.name ? { name: twin.name } : {}),
@@ -233,7 +242,9 @@ export async function attachAsCollected(input: AttachAsCollectedInput): Promise<
             await prisma.issue.create({
                 data: {
                     seriesId: owner.id, attachedVolumeId: attachment.id, number, isAnnual: false, filePath: target, status: 'DOWNLOADED',
-                    metadataId: `unmatched_${Math.random()}`, metadataSource: 'LOCAL', matchState: 'UNMATCHED', name: `Vol. ${number}`,
+                    ...(isLocal
+                        ? localIdentity
+                        : { metadataId: `unmatched_${Math.random()}`, metadataSource: 'LOCAL', matchState: 'UNMATCHED', name: `Vol. ${number}` }),
                 },
             });
             result.claimed++;

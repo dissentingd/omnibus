@@ -198,3 +198,46 @@ describe('AttachedVolumesManager (COLLECTED)', () => {
         })));
     });
 });
+
+// A collected edition the provider has no volume for (field report by robotshavehearts2): attach
+// it by name. It lists as Local, never offers a provider id, and its files are the ones in the
+// folder whose names carry it.
+describe('AttachedVolumesManager (COLLECTED, local by name)', () => {
+    beforeEach(() => { vi.clearAllMocks(); });
+    afterEach(() => { vi.unstubAllGlobals(); });
+
+    it('adds a collected edition by name as a LOCAL attachment', async () => {
+        const fetchMock = stubFetchRouter([
+            [/\/api\/library\/series\/attachments\?/, () => ok({ attachments: [] })],
+            ['/api/library/series/attachments', () => ok({ success: true, local: true, attachmentId: 'attL', name: 'Batman: The Court of Owls Compendium', summary: { total: 2, claimed: 2, created: 0, updated: 0, unclaimed: 0 } })],
+        ]);
+        const onChanged = vi.fn();
+
+        render(<AttachedVolumesManager {...baseProps} kind="COLLECTED" onChanged={onChanged} />);
+        fireEvent.click(await screen.findByText('Attach collected edition'));
+
+        const name = await screen.findByLabelText('Name of the collected edition');
+        fireEvent.change(name, { target: { value: 'Batman: The Court of Owls Compendium' } });
+        fireEvent.click(screen.getByRole('button', { name: 'Add it by name' }));
+
+        await waitFor(() => {
+            const post = fetchMock.mock.calls.find(c => c[1]?.method === 'POST');
+            expect(JSON.parse(post![1].body)).toEqual({ seriesId: 's1', metadataSource: 'LOCAL', kind: 'COLLECTED', name: 'Batman: The Court of Owls Compendium' });
+        });
+        await waitFor(() => expect(toast).toHaveBeenCalledWith(expect.objectContaining({ title: 'Attached Batman: The Court of Owls Compendium' })));
+        expect(onChanged).toHaveBeenCalled();
+    });
+
+    it('lists a local attachment as Local, with no provider id and no Refresh', async () => {
+        stubFetchRouter([[/\/api\/library\/series\/attachments\?/, () => ok({ attachments: [
+            { id: 'attL', metadataSource: 'LOCAL', volumeId: 'local_abc', kind: 'COLLECTED', name: 'Court of Owls Compendium', startYear: null, issueCount: 2, ownedCount: 2, lastSyncedAt: null },
+        ] })]]);
+
+        render(<AttachedVolumesManager {...baseProps} kind="COLLECTED" />);
+
+        expect(await screen.findByText('Court of Owls Compendium')).toBeTruthy();
+        expect(screen.getByText(/Local · 2 owned/)).toBeTruthy();
+        expect(screen.queryByText(/local_abc/)).toBeNull();
+        expect(screen.queryByRole('button', { name: /Refresh/ })).toBeNull();
+    });
+});

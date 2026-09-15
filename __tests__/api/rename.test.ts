@@ -220,4 +220,59 @@ describe('API Route: Bulk Library Renamer', () => {
             })
         }));
     });
+
+    // A LOCAL collected edition's files are claimed by NAME alone (no provider id to fall back on),
+    // so the local loop must name its books after the edition — "Batman Compendium Vol. 001" — while
+    // a provider-backed trade in the same series still takes the series name.
+    it('names a LOCAL collected edition\'s books after the edition, and a provider trade after the series', async () => {
+        mocks.libraryFindMany.mockResolvedValue([{ id: 'lib_1', path: '/data/comics' }]);
+        mocks.fsExistsSync.mockImplementation((p: string | Buffer | URL) => {
+            if (!p) return false;
+            // Targets do not exist yet; the source folder and its files do.
+            if (/Vol\. 00\d|#00\d/.test(p.toString())) return false;
+            return true;
+        });
+        mocks.seriesFindMany.mockResolvedValue([{
+            id: 'series_1', libraryId: 'lib_1', folderPath: '/data/comics/DC Comics/Batman (2016)',
+            publisher: 'DC Comics', name: 'Batman', year: 2016, isManga: false,
+        }]);
+        mocks.issueFindMany.mockResolvedValue([
+            {
+                id: 'local_book', seriesId: 'series_1', number: '1', name: 'Vol. 1', releaseDate: null,
+                filePath: '/data/comics/DC Comics/Batman (2016)/Batman Compendium 01.cbz',
+                attachedVolume: { kind: 'COLLECTED', metadataSource: 'LOCAL', name: 'Batman Compendium' },
+            },
+            {
+                id: 'cv_book', seriesId: 'series_1', number: '2', name: 'Vol. 2: City of Owls', releaseDate: '2016-06-01',
+                filePath: '/data/comics/DC Comics/Batman (2016)/Batman TPB 02.cbz',
+                attachedVolume: { kind: 'COLLECTED', metadataSource: 'COMICVINE', name: 'Batman' },
+            },
+            {
+                id: 'issue_3', seriesId: 'series_1', number: '3', name: 'Batman #3', releaseDate: '2016-03-01',
+                filePath: '/data/comics/DC Comics/Batman (2016)/Batman 3.cbz', attachedVolume: null,
+            },
+        ]);
+
+        const req = new NextRequest('http://localhost/api/library/rename', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                seriesIds: ['series_1'],
+                folderPattern: '{Publisher}/{Series} ({Year})',
+                filePattern: '{Series} #{Issue}',
+            }),
+        });
+        const data = await (await POST(req)).json();
+        expect(data).toMatchObject({ success: true, filesRenamed: 3, conflicts: 0 });
+
+        // The route has to ask for what the rule needs: the attachment's source and name.
+        expect(mocks.issueFindMany).toHaveBeenCalledWith(expect.objectContaining({
+            include: { attachedVolume: { select: expect.objectContaining({ kind: true, metadataSource: true, name: true }) } },
+        }));
+        const targets = mocks.fsMove.mock.calls.map(c => path.basename(c[1]));
+        expect(targets).toContain('Batman Compendium Vol. 001 (2016).cbz');
+        expect(targets).toContain('Batman Vol. 002 (2016).cbz');
+        expect(targets).toContain('Batman #003.cbz');
+        expect(targets).not.toContain('Batman Vol. 001 (2016).cbz');
+    });
 });
