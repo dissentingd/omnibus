@@ -1201,11 +1201,15 @@ fn issue_descriptor_from_filename_unhinted(file_name: &str) -> (String, bool) {
     });
     let re_num = RE_NUM.get_or_init(|| Regex::new(r"\d+(?:\.\d+)?[a-zA-Z]?").unwrap());
 
-    // 1. Strip a trailing extension.
+    // 1. Strip a trailing extension. #205: an extension STARTS WITH A LETTER — a numeric tail
+    //    ("Bone (1991) 13.5" handed over without its extension) is the issue number, not ".5".
+    //    Parity: issue-parser.ts describeIssueFromFilename.
     let mut clean = file_name.to_string();
     if let Some(dot) = clean.rfind('.') {
         let ext = &clean[dot + 1..];
-        if !ext.is_empty() && ext.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        if ext.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
+            && ext.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
             clean = clean[..dot].to_string();
         }
     }
@@ -3542,6 +3546,22 @@ mod tests {
         assert_eq!(issue_number_from_filename("Vol 3.cbz", None), "3");
         assert_eq!(issue_number_from_filename("007.cbz", None), "7");
         assert_eq!(issue_number_from_filename("Amazing Series 12a.cbz", None), "12a");
+    }
+
+    // #205 (BeepbopbeepityBop): a numeric tail is never an extension — "Bone (1991) 13.5" handed
+    // over without its extension must not lose the ".5" to the extension strip. Only a known
+    // archive extension is stripped. Parity with the Node #205 extractor tests.
+    #[test]
+    fn issue_number_keeps_a_decimal_when_the_name_has_no_extension() {
+        assert_eq!(issue_number_from_filename("Bone (1991) 13.5", None), "13.5");
+        assert_eq!(issue_number_from_filename("Bone (1991) 13.5", Some("Bone")), "13.5");
+        assert_eq!(issue_number_from_filename("Wizard #1½", None), "1.5");
+        // Real extensions still go, whatever their case; a dotted title is not an extension.
+        assert_eq!(issue_number_from_filename("Bone (1991) 13.5.cbz", None), "13.5");
+        assert_eq!(issue_number_from_filename("Batman 001.CBR", None), "1");
+        assert_eq!(issue_number_from_filename("Saga 012.cb7", None), "12");
+        assert_eq!(issue_number_from_filename("Mr. Punch 003", None), "3");
+        assert_eq!(issue_number_from_filename("Kaiju No. 8 v02", Some("Kaiju No. 8")), "2");
     }
 
     // Mirrors Node __tests__/lib/utils/issue-parser.test.ts (beta.023/035 negative-number support).

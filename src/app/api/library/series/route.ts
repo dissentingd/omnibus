@@ -146,9 +146,13 @@ export async function GET(request: Request) {
         // are the user's curation, so "Vol. 1" of a trade shares nothing but a digit with issue #1.
         // Keying attached rows by their attachment keeps each lane apart from the run and from every
         // other lane, which is what lets the same number exist in several of them at once.
+        // #205 (BeepbopbeepityBop): ComicVine numbers a half-issue "13½" while the file — and every
+        // parsed number — says "13.5". Keyed as raw strings they never met, so the page kept a
+        // matched row with no file beside an unmatched row holding the file. One number, one key.
+        const numKey = (n: unknown) => normalizeFractionNumbers(String(n ?? '')).replace(/^0+(?=\d)/, '');
         const issuesByNum = new Map<string, any[]>();
         for (const issue of existingIssues) {
-            const stdNum = issue.number.replace(/^0+(?=\d)/, '');
+            const stdNum = numKey(issue.number);
             const key = issue.attachedVolumeId
                 ? `att:${issue.attachedVolumeId}:${stdNum}`
                 : `${issue.isAnnual ? 'annual:' : ''}${stdNum}`;
@@ -243,9 +247,9 @@ export async function GET(request: Request) {
                             : describeIssueFromFilename(file, seriesRecord?.name || undefined);
                     const key = owner
                         ? (owner.attachedVolumeId
-                            ? `att:${owner.attachedVolumeId}:${desc.number.replace(/^0+(?=\d)/, '')}`
-                            : `${desc.isAnnual ? 'annual:' : ''}${desc.number.replace(/^0+(?=\d)/, '')}`)
-                        : lane ? `att:${lane.id}:${desc.number}` : `${desc.isAnnual ? 'annual:' : ''}${desc.number}`;
+                            ? `att:${owner.attachedVolumeId}:${numKey(desc.number)}`
+                            : `${desc.isAnnual ? 'annual:' : ''}${numKey(desc.number)}`)
+                        : lane ? `att:${lane.id}:${numKey(desc.number)}` : `${desc.isAnnual ? 'annual:' : ''}${numKey(desc.number)}`;
                     const entry = filesByNum.get(key);
                     if (entry) entry.files.push(file);
                     else filesByNum.set(key, { number: desc.number, isAnnual: desc.isAnnual, files: [file], localLaneId: lane && localLaneIds.has(lane.id) ? lane.id : undefined });

@@ -14,7 +14,7 @@ import { AuditLogger } from '@/lib/audit-logger';
 import { getAuthOptions } from '@/app/api/auth/[...nextauth]/options';
 import { getServerSession } from 'next-auth/next';
 import { omnibusQueue } from '@/lib/queue';
-import { describeIssueFromFilename, normalizeFractionNumbers } from '@/lib/utils/issue-parser';
+import { describeIssueFromFilename, normalizeFractionNumbers, isSameIssue } from '@/lib/utils/issue-parser';
 import { COMIC_EXTENSIONS } from '@/lib/utils/formats';
 import { sanitizeFilename } from '@/lib/utils/sanitize';
 import { UNMATCHED_DIR, CONFIG_DIR, isPathWithinRoots } from '@/lib/utils/paths';
@@ -515,6 +515,9 @@ export async function POST(request: Request) {
                     if (existingRecord) {
                         const updatePayload: any = {
                             filePath: newFilePath,
+                            // #205: an adopted skeleton (WANTED) now holds a file — it is downloaded,
+                            // as the scanner and the series page both record it.
+                            status: 'DOWNLOADED',
                             number: issueNumStr,
                             // #203: the domain is part of numbering identity — a matched annual has
                             // to BE an annual row, or it collides with the main run's same number.
@@ -533,16 +536,25 @@ export async function POST(request: Request) {
                         try {
                             // #203: find within the SAME domain — "Annual #1" must never adopt the
                             // main run's "#1" row (Phase 0's rule, applied at the match surface too).
-                            const existingIssue = await prisma.issue.findFirst({
-                                where: { seriesId: existingRecord.id, number: issueNumStr, isAnnual: isAnnualFile }
+                            // #205: by issue IDENTITY, never the raw string — the provider's row may
+                            // read "13½" while the file and the admin say "13.5". Looked up as a
+                            // string, that row was missed and Accept created a twin beside it.
+                            const domainRows: Array<{ id: string; number: string }> = await prisma.issue.findMany({
+                                where: { seriesId: existingRecord.id, isAnnual: isAnnualFile },
+                                select: { id: true, number: true },
                             });
+                            const existingIssue = domainRows.find(r => isSameIssue(r.number, issueNumStr)) ?? null;
 
                             let finalIssueId;
 
                             if (existingIssue) {
+                                // The row's number is its identity (#194): an adopted "13½" stays
+                                // "13½" — only the file, the link and the domain are written.
+                                const adoptPayload = { ...updatePayload };
+                                delete adoptPayload.number;
                                 const updated = await prisma.issue.update({
                                     where: { id: existingIssue.id },
-                                    data: updatePayload
+                                    data: adoptPayload
                                 });
                                 finalIssueId = updated.id;
                                 Logger.log(`[Match Series Debug] DB Updated successfully for Issue ${issueNumStr}`, 'debug');

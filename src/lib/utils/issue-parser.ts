@@ -92,7 +92,10 @@ export function describeIssueFromFilename(filename: string, seriesName?: string)
             return { number: "1", isAnnual: false };
         }
     }
-    let clean = filename.replace(/\.\w+$/, '');
+    // #205: an extension STARTS WITH A LETTER. The Smart Matcher hands over names with the
+    // extension already gone, and "Bone (1991) 13.5" used to lose its ".5" here — read as #13.
+    // Parity: scanner.rs issue_descriptor_from_filename_unhinted.
+    let clean = filename.replace(/\.[a-zA-Z]\w*$/, '');
 
     // 1. Strip years explicitly
     clean = clean.replace(/\[\d{4}(?:-\d{4})?\]/g, '').replace(/\(\d{4}(?:-\d{4})?\)/g, ''); 

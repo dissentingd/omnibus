@@ -10,6 +10,30 @@ import {
     resolveIssueIdByNumber,
 } from '../../src/lib/utils/smart-match-search';
 
+// #205 (BeepbopbeepityBop): ComicVine numbers half-issues with a vulgar fraction — Bone (1991)
+// #13.5 is "13½" in the volume's issue list — while the admin (and every filename) types "13.5".
+// The cross-reference has to see them as one number, or a hand-typed 13.5 "can't find the issue".
+describe('normalizeIssueNumber + findIssueIdByNumber with vulgar fractions (#205)', () => {
+    it('reads ½ as .5 on either side of the comparison', () => {
+        expect(normalizeIssueNumber('13½')).toBe('13.5');
+        expect(normalizeIssueNumber('½')).toBe('0.5');
+        expect(normalizeIssueNumber('013.5')).toBe('13.5');
+    });
+
+    it('finds ComicVine\'s "13½" from a typed "13.5", and "½" from "0.5"', () => {
+        const rawIssues = [
+            { id: 317232, issue_number: '13' },
+            { id: 317233, issue_number: '13½' },
+            { id: 317234, issue_number: '14' },
+            { id: 100001, issue_number: '½' },
+        ];
+        expect(findIssueIdByNumber(rawIssues, '13.5')).toBe('317233');
+        expect(findIssueIdByNumber(rawIssues, '13½')).toBe('317233');
+        expect(findIssueIdByNumber(rawIssues, '0.5')).toBe('100001');
+        expect(findIssueIdByNumber(rawIssues, '13')).toBe('317232');
+    });
+});
+
 // #199 round 4 Beta B: keep-mode's silent carry — the files' CONTENT fields land and lock at
 // Accept even when the admin never opened the editor. Identity (name/year/publisher) stays with
 // the chosen match; an empty prefill changes nothing at all.

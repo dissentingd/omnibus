@@ -127,6 +127,52 @@ describe('#203 beta.010 regression: attached-lane rows vs. the folder file sync'
         expect(rows[0]).toEqual(expect.objectContaining({ number: '1', isAnnual: true, filePath: expect.stringContaining("'96 #001") }));
     });
 
+    // #205 (BeepbopbeepityBop): ComicVine stores Bone (1991) #13.5 as "13½"; the file is named
+    // "Bone (1991) 13.5.cbz" and parses to "13.5". Keyed as raw strings those never met, so the
+    // page kept a matched row with no file beside an unmatched row holding the file — "missing and
+    // there at the same time". One number, one group: the matched row wins and takes the file.
+    it('#205: a ComicVine "13½" row and the file\'s "13.5" row are one issue — the split heals', async () => {
+        const F = '/comics/Bone';
+        (prisma.series.findFirst as any).mockResolvedValue({
+            id: 's1', name: 'Bone', year: 1991, folderPath: F, metadataId: '2127', metadataSource: 'COMICVINE',
+        });
+        const file = `${F}/Bone (1991) 13.5.cbz`;
+        (prisma.issue.findMany as any).mockResolvedValue([
+            { id: 'cv', number: '13½', isAnnual: false, metadataId: '317233', filePath: null, attachedVolumeId: null },
+            { id: 'split', number: '13.5', isAnnual: false, metadataId: 'unmatched_z', filePath: file, attachedVolumeId: null },
+            { id: 'i13', number: '13', isAnnual: false, metadataId: '317232', filePath: `${F}/Bone (1991) 13.cbz`, attachedVolumeId: null },
+        ]);
+        disk.files = ['Bone (1991) 13.cbz', 'Bone (1991) 13.5.cbz'];
+
+        const body = await (await GET(getReq(`http://localhost/api/library/series?path=${encodeURIComponent(F)}`))).json();
+        // The placeholder goes; the ComicVine row is the survivor.
+        expect(deletedIds()).toEqual(['split']);
+        // …and it takes the file the placeholder was holding, by the same key.
+        // (path.join emits the platform separator, hence the contains-match.)
+        expect((prisma.issue.update as any).mock.calls.map((c: any[]) => c[0])).toContainEqual(
+            expect.objectContaining({ where: { id: 'cv' }, data: expect.objectContaining({ filePath: expect.stringContaining('Bone (1991) 13.5.cbz'), status: 'DOWNLOADED' }) })
+        );
+        expect(created()).toEqual([]);
+        expect(body.duplicates).toEqual([]);
+    });
+
+    it('#205: a file parsing to "13.5" binds to an existing "13½" row instead of spawning a row of its own', async () => {
+        const F = '/comics/Bone';
+        (prisma.series.findFirst as any).mockResolvedValue({
+            id: 's1', name: 'Bone', year: 1991, folderPath: F, metadataId: '2127', metadataSource: 'COMICVINE',
+        });
+        (prisma.issue.findMany as any).mockResolvedValue([
+            { id: 'cv', number: '13½', isAnnual: false, metadataId: '317233', filePath: null, attachedVolumeId: null },
+        ]);
+        disk.files = ['Bone (1991) 13.5.cbz'];
+
+        await GET(getReq(`http://localhost/api/library/series?path=${encodeURIComponent(F)}`));
+        expect(created()).toEqual([]);
+        expect((prisma.issue.update as any).mock.calls.map((c: any[]) => c[0])).toContainEqual(
+            expect.objectContaining({ where: { id: 'cv' }, data: expect.objectContaining({ filePath: expect.stringContaining('Bone (1991) 13.5.cbz') }) })
+        );
+    });
+
     // #203 round 3: the page labels an attached row with its volume's name and can sort by release
     // date, so both ride on every issue row — the lane's name for attached rows only.
     it('carries the attached volume\'s name and the release date on each issue row', async () => {

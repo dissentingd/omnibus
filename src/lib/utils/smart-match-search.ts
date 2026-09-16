@@ -3,6 +3,7 @@
 // classic exact-provider-ID lookup kept as the advanced fallback. Both paths funnel into
 // the same volume-details resolution, so the shapes here are the single source of truth
 // for what the page holds as a "manual match result".
+import { normalizeFractionNumbers } from '@/lib/utils/issue-parser'
 
 /** The suggestion shape the matcher stores for a manually-resolved volume/series. */
 export interface ManualSuggestion {
@@ -27,9 +28,10 @@ export function cleanProviderId(raw: string): string {
     return (raw || '').replace('4050-', '').replace(/[^0-9a-zA-Z-]/g, '')
 }
 
-/** "049" and "49" are the same issue; leading zeros are presentation, not identity. */
+/** "049" and "49" are the same issue; leading zeros are presentation, not identity. So are
+ *  ComicVine's vulgar fractions (#205): its "13½" is the admin's "13.5". */
 export function normalizeIssueNumber(n: unknown): string {
-    return (n ?? '').toString().trim().replace(/^0+(?=\d)/, '')
+    return normalizeFractionNumbers((n ?? '').toString().trim()).replace(/^0+(?=\d)/, '')
 }
 
 /**

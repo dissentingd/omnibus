@@ -363,6 +363,43 @@ describe('API Route: Smart Matcher (/api/library/match-series)', () => {
         }));
     });
 
+    // #205 (BeepbopbeepityBop): ComicVine's row for Bone (1991) #13.5 is numbered "13½"; the admin's
+    // exact override says "13.5". Looked up as a raw string the row was never found, so Accept
+    // created a SECOND row for the file beside it — "missing and there at the same time".
+    it('#205: an exact override "13.5" adopts the existing "13½" row instead of creating a twin', async () => {
+        vi.mocked(fs.promises.stat).mockResolvedValueOnce({ isFile: () => true } as any);
+        vi.mocked(fs.existsSync).mockImplementation((p: any) => String(p) === '/unmatched/Bone (1991) 13.5.cbz');
+        vi.mocked(fs.promises.readdir).mockResolvedValueOnce(['Bone (1991) 13.5.cbz'] as any);
+        vi.mocked(axios.get).mockResolvedValue({ data: Buffer.from('series-cover') } as any);
+        mocks.getSeriesDetails.mockResolvedValueOnce({ name: 'Bone', year: 1991, publisher: 'Cartoon Books', coverUrl: 'http://cover/img.jpg', status: 'Ended' });
+        mocks.findFirstSeries.mockResolvedValue({ id: 's1' });
+        mocks.updateSeries.mockResolvedValue({ id: 's1', year: 1991 });
+        // The series' rows in the file's domain: ComicVine's own "13½" and its neighbours.
+        mocks.findManyIssues.mockImplementation(async (args: any) =>
+            args?.where?.seriesId === 's1' && args?.where?.isAnnual === false
+                ? [{ id: 'cv_row', number: '13½' }, { id: 'i13', number: '13' }, { id: 'i14', number: '14' }]
+                : []
+        );
+        mocks.updateIssue.mockResolvedValue({ id: 'cv_row' });
+
+        const res = await POST(createReq({
+            oldFolderPath: '/unmatched/Bone (1991) 13.5.cbz',
+            metadataId: '2127',
+            metadataSource: 'METRON',
+            exactIssueNumber: '13.5',
+            exactIssueId: '317233',
+        }));
+        expect(res.status).toBe(200);
+
+        // The existing row took the file and the provider link; nothing new was created.
+        expect(mocks.createIssue).not.toHaveBeenCalled();
+        const adopt = mocks.updateIssue.mock.calls.map(c => c[0]).find(c => c?.where?.id === 'cv_row');
+        expect(adopt).toBeTruthy();
+        expect(adopt.data).toEqual(expect.objectContaining({ filePath: expect.stringContaining('13.5'), metadataId: '317233', matchState: 'MATCHED', status: 'DOWNLOADED' }));
+        // The row's number is its identity — ComicVine's "13½" is not rewritten to the typed form.
+        expect(adopt.data.number).toBeUndefined();
+    });
+
     it('should refuse to overwrite a same-named loose file and report the conflict', async () => {
         // isFile = true and the target name already exists (existsSync defaults to true) → leave the loose
         // file in place, count the conflict, and never call rename (no clobber).

@@ -24,6 +24,29 @@ describe('Utility: Issue Number Parser', () => {
         });
     });
 
+    // #205 (BeepbopbeepityBop, discussion #161): the Smart Matcher hands the parser names with the
+    // extension already stripped, and "Bone (1991) 13.5" lost its ".5" to the extension strip —
+    // detected as #13. A numeric tail is never an extension; only a known archive extension is.
+    describe('extractIssueNumber() and extensions (#205)', () => {
+        it('keeps a decimal issue number when the name carries no extension', () => {
+            expect(extractIssueNumber('Bone (1991) 13.5')).toBe('13.5');
+            expect(extractIssueNumber('Bone (1991) 13.5', 'Bone')).toBe('13.5');
+            expect(extractIssueNumber('Wizard #1½')).toBe('1.5');
+        });
+
+        it('still strips a real archive extension, whatever its case', () => {
+            expect(extractIssueNumber('Bone (1991) 13.5.cbz')).toBe('13.5');
+            expect(extractIssueNumber('Batman 001.CBR')).toBe('1');
+            expect(extractIssueNumber('Saga 012.cb7')).toBe('12');
+            expect(extractIssueNumber('Series 2020.cbz')).toBe('1'); // only a year → the default
+        });
+
+        it('never mistakes a dotted title for an extension', () => {
+            expect(extractIssueNumber('Mr. Punch 003')).toBe('3');
+            expect(extractIssueNumber('Kaiju No. 8 v02', 'Kaiju No. 8')).toBe('2');
+        });
+    });
+
     // 2026-07-25 worklist item 9 (Kaiju No. 8): when the caller knows the series name, digits that
     // belong to the TITLE must not be read as issue numbers. The series name is consumed as a
     // punctuation/case-insensitive prefix before extraction; without the hint, behavior is unchanged.
