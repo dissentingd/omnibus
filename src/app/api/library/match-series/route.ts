@@ -426,6 +426,29 @@ export async function POST(request: Request) {
         const { conflicts: folderConflicts } = await safeRelocateFolder(oldFolderPath, newFolderPath, srcRoot);
         conflicts += folderConflicts;
         activeFolderPath = newFolderPath;
+
+        // FIX (comicinfo-embed-stale-path): safeRelocateFolder only moves files on disk. The per-file
+        // loop below only updates Issue.filePath for the single "clicked" target file (isTargetFile
+        // guard) -- every sibling issue in a folder-level match is left with a filePath pointing at
+        // oldFolderPath, which no longer exists. inject_xml_into_zip's path.exists() check then
+        // silently no-ops the embed for every one of them. Repoint every affected row's filePath
+        // prefix now that the physical move already happened -- pure DB correction, no filesystem writes.
+        if (existingRecord?.id) {
+            const staleIssues = await prisma.issue.findMany({
+                where: { seriesId: existingRecord.id, filePath: { startsWith: oldFolderPath } }
+            });
+            for (const issue of staleIssues) {
+                if (!issue.filePath) continue;
+                const relative = issue.filePath.slice(oldFolderPath.length);
+                await prisma.issue.update({
+                    where: { id: issue.id },
+                    data: { filePath: newFolderPath + relative }
+                });
+            }
+            if (staleIssues.length > 0) {
+                Logger.log(`[Match Series] Repointed filePath for ${staleIssues.length} issue(s) after folder relocate.`, 'info');
+            }
+        }
     }
 
     try {
@@ -740,15 +763,17 @@ export async function POST(request: Request) {
             }
         }
 
-        // When the admin supplied custom metadata, embed it (SeriesGroup/Universe/Description) into the
-        // files' ComicInfo.xml — unless they turned the per-edit toggle off, in which case fall back to
-        // the global default. Mirrors library/update's EMBED-on-write resolution.
-        if (lockMetadata && existingRecord?.id) {
-            const doWrite = writeToFile !== undefined ? writeToFile : (config.metadata_write_comicinfo !== 'false');
-            if (doWrite) {
-                await omnibusQueue.add('EMBED_METADATA', { type: 'EMBED_METADATA', seriesId: existingRecord.id }, { jobId: `EMBED_META_MATCH_${existingRecord.id}_${Date.now()}` });
-            }
-        }
+        // FIX (comicinfo-embed-race): this used to also queue a standalone EMBED_METADATA job here,
+        // racing the METADATA_SYNC job queued a few lines above -- both fire near-simultaneously,
+        // METADATA_SYNC's real ComicVine/Metron fetch lands 3-8s later, and this job would embed
+        // whatever was in the DB *before* that fetch completed, with nothing to re-trigger it
+        // afterward. Since METADATA_SYNC is unconditionally queued above whenever existingRecord?.id
+        // is set (the exact same guard this block used), it is always redundant with it -- the
+        // engine's own sync loop (metadata.rs) already embeds correctly, synchronously, right after
+        // its own fetch completes for this series, which naturally includes whatever custom
+        // SeriesGroup/Universe/Description the admin just set (file_metadata_priority means the sync
+        // never overwrites it). Removed rather than "fixed" with a delay/lock, since the already-
+        // correct path made it unnecessary in the first place.
     } catch (e: any) {
         Logger.log(`[Match Series] Failed to queue jobs: ${e.message}`, 'warn');
     }
