@@ -19,21 +19,24 @@ vi.mock('fs-extra', () => ({
 
 import { findDuplicateGroups, filenamesDisagree } from '@/lib/duplicate-detector';
 
-const issue = (id: string, seriesId: string, number: string, filePath: string, seriesName = 'Batman', metadataId: string | null = null, metadataSource: string | null = null, isAnnual = false) =>
-    ({ id, seriesId, number, isAnnual, filePath, series: { name: seriesName, metadataId, metadataSource } });
+type Lane = { id: string; name: string; kind?: string } | null;
+const issue = (id: string, seriesId: string, number: string, filePath: string, seriesName = 'Batman', metadataId: string | null = null, metadataSource: string | null = null, isAnnual = false, lane: Lane = null) =>
+    ({ id, seriesId, number, isAnnual, filePath, series: { name: seriesName, metadataId, metadataSource },
+       attachedVolumeId: lane ? lane.id : null, attachedVolume: lane ? { name: lane.name, kind: lane.kind || 'ANNUAL' } : null });
 
-// Drive both prisma calls from one dataset: groupBy returns the (seriesId, number, isAnnual) tuples
-// the DB would report with count > 1 (#203: the annual domain joined the grouping key), and findMany
-// returns the issues in those candidate series (as the real `seriesId in seriesIds` query would).
+// Drive both prisma calls from one dataset: groupBy returns the (seriesId, number, isAnnual,
+// attachedVolumeId) tuples the DB would report with count > 1 (#203: the annual domain joined the
+// grouping key; the attached LANE joined it after anacronismo's seven-annual-volumes report), and
+// findMany returns the issues in those candidate series (as the real `seriesId in seriesIds` query would).
 function setIssues(issues: ReturnType<typeof issue>[]) {
     const counts = new Map<string, number>();
     for (const i of issues) {
-        const k = `${i.seriesId} ${i.isAnnual ? 1 : 0} ${i.number}`;
+        const k = `${i.seriesId} ${i.isAnnual ? 1 : 0} ${i.attachedVolumeId || '-'} ${i.number}`;
         counts.set(k, (counts.get(k) || 0) + 1);
     }
     const groups = [...counts.entries()]
         .filter(([, n]) => n > 1)
-        .map(([k, n]) => { const [seriesId, ann, number] = k.split(' '); return { seriesId, number, isAnnual: ann === '1', _count: { seriesId: n } }; });
+        .map(([k, n]) => { const [seriesId, ann, lane, number] = k.split(' '); return { seriesId, number, isAnnual: ann === '1', attachedVolumeId: lane === '-' ? null : lane, _count: { seriesId: n } }; });
     mocks.issueGroupBy.mockResolvedValue(groups);
     const candidateSeries = new Set(groups.map(g => g.seriesId));
     mocks.issueFindMany.mockResolvedValue(issues.filter(i => candidateSeries.has(i.seriesId)));
@@ -102,6 +105,86 @@ describe('findDuplicateGroups', () => {
     it('returns an empty array when there are no issues', async () => {
         setIssues([]);
         expect(await findDuplicateGroups()).toEqual([]);
+    });
+});
+
+// #203 round 3 (anacronismo, 2026-09-13): seven attached annual volumes on The Amazing Spider-Man
+// (the 1964 annual, '96, '97, '98, 1999, 2000, 2001) each own a "#1" — seven different comics that
+// the resolver grouped as ONE "Annual #1" with a "Delete 6 in this group" button. An attached lane
+// is its own numbering domain (the series page has keyed it so since beta.010); the detector must too.
+describe('attached lanes (#203)', () => {
+    const asm = (id: string, file: string, lane: Lane) =>
+        issue(id, 'asm', '1', `/comics/Marvel/The Amazing Spider-Man (1963)/${file}`, 'The Amazing Spider-Man', '2127', 'COMICVINE', true, lane);
+
+    it('asks the database to group by the attached lane as well', async () => {
+        setIssues([]);
+        await findDuplicateGroups();
+        expect(mocks.issueGroupBy).toHaveBeenCalledWith(expect.objectContaining({
+            by: expect.arrayContaining(['seriesId', 'number', 'isAnnual', 'attachedVolumeId']),
+        }));
+    });
+
+    it('never groups the same number across different attached lanes (the seven ASM annual #1s)', async () => {
+        setIssues([
+            asm('a64', 'The Amazing Spider-Man Annual #001 (1964).cbz', { id: 'v60436', name: 'The Amazing Spider-Man Annual' }),
+            asm('a96', "The Amazing Spider-Man '96 #001 (1996).cbz", { id: 'v60438', name: "The Amazing Spider-Man '96" }),
+            asm('a97', "The Amazing Spider-Man '97 #001 (1997).cbz", { id: 'v60440', name: "The Amazing Spider-Man '97" }),
+            asm('a98', "Spider-Man '98 #001 (1998).cbz", { id: 'v60441', name: "Spider-Man '98" }),
+            asm('a99', 'The Amazing Spider-Man 1999 #001 (1999).cbz', { id: 'v60442', name: 'The Amazing Spider-Man 1999' }),
+            asm('a00', 'The Amazing Spider-Man 2000 #001 (2000).cbz', { id: 'v60443', name: 'The Amazing Spider-Man 2000' }),
+            asm('a01', 'The Amazing Spider-Man 2001 #001 (2001).cbz', { id: 'v60444', name: 'The Amazing Spider-Man 2001' }),
+        ]);
+        expect(await findDuplicateGroups()).toHaveLength(0);
+
+        // With a genuine second copy in ONE lane the series becomes a candidate and every row comes
+        // back from the database — the in-memory pass must still keep the other six lanes apart.
+        setIssues([
+            asm('a64', 'The Amazing Spider-Man Annual #001 (1964).cbz', { id: 'v60436', name: 'The Amazing Spider-Man Annual' }),
+            asm('a96', "The Amazing Spider-Man '96 #001 (1996).cbz", { id: 'v60438', name: "The Amazing Spider-Man '96" }),
+            asm('a96b', "The Amazing Spider-Man '96 #01 (1996) (digital).cbz", { id: 'v60438', name: "The Amazing Spider-Man '96" }),
+            asm('a97', "The Amazing Spider-Man '97 #001 (1997).cbz", { id: 'v60440', name: "The Amazing Spider-Man '97" }),
+            asm('a98', "Spider-Man '98 #001 (1998).cbz", { id: 'v60441', name: "Spider-Man '98" }),
+            asm('a99', 'The Amazing Spider-Man 1999 #001 (1999).cbz', { id: 'v60442', name: 'The Amazing Spider-Man 1999' }),
+            asm('a00', 'The Amazing Spider-Man 2000 #001 (2000).cbz', { id: 'v60443', name: 'The Amazing Spider-Man 2000' }),
+            asm('a01', 'The Amazing Spider-Man 2001 #001 (2001).cbz', { id: 'v60444', name: 'The Amazing Spider-Man 2001' }),
+        ]);
+        const groups = await findDuplicateGroups();
+        expect(groups).toHaveLength(1);
+        expect(groups[0].files.map(f => f.id).sort()).toEqual(['a96', 'a96b']);
+    });
+
+    it('does not group a lane\'s annual with an unattached annual of the same number', async () => {
+        setIssues([
+            asm('loose', 'The Amazing Spider-Man Annual 001.cbz', null),
+            asm('a96', "The Amazing Spider-Man '96 #001 (1996).cbz", { id: 'v60438', name: "The Amazing Spider-Man '96" }),
+        ]);
+        expect(await findDuplicateGroups()).toHaveLength(0);
+    });
+
+    it('still flags two copies inside ONE lane, naming the lane so the resolver can say which', async () => {
+        setIssues([
+            asm('copy1', "The Amazing Spider-Man '96 #001 (1996).cbz", { id: 'v60438', name: "The Amazing Spider-Man '96" }),
+            asm('copy2', "The Amazing Spider-Man '96 #01 (1996) (digital).cbz", { id: 'v60438', name: "The Amazing Spider-Man '96" }),
+        ]);
+        const groups = await findDuplicateGroups();
+        expect(groups).toHaveLength(1);
+        expect(groups[0]).toMatchObject({ issueNumber: '1', isAnnual: true, attachedVolumeId: 'v60438', laneName: "The Amazing Spider-Man '96", laneKind: 'ANNUAL', suspectedMispair: false });
+        expect(groups[0].files.map(f => f.id).sort()).toEqual(['copy1', 'copy2']);
+    });
+
+    it('reports a collected lane\'s kind, and no lane for a main-run group', async () => {
+        setIssues([
+            issue('t1', 's1', '1', '/lib/s1/Batman Vol. 001.cbz', 'Batman', null, null, false, { id: 'tpb', name: 'Batman: The Deluxe Edition', kind: 'COLLECTED' }),
+            issue('t2', 's1', '1', '/lib/s1/Batman Vol. 01 (2012).cbz', 'Batman', null, null, false, { id: 'tpb', name: 'Batman: The Deluxe Edition', kind: 'COLLECTED' }),
+            issue('m1', 's1', '2', '/lib/s1/Batman 002.cbz'),
+            issue('m2', 's1', '2', '/lib/s1/Batman 02.cbz'),
+        ]);
+        const groups = await findDuplicateGroups();
+        expect(groups).toHaveLength(2);
+        const tpb = groups.find(g => g.attachedVolumeId === 'tpb')!;
+        expect(tpb).toMatchObject({ laneName: 'Batman: The Deluxe Edition', laneKind: 'COLLECTED', issueNumber: '1' });
+        const main = groups.find(g => g.issueNumber === '2')!;
+        expect(main).toMatchObject({ attachedVolumeId: null, laneName: null, laneKind: null });
     });
 });
 

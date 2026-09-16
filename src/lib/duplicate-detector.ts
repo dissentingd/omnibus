@@ -27,6 +27,15 @@ export interface DuplicateGroup {
     issueNumber: string;
     /** #203: the group's numbering domain — annual groups are reported as "Annual #N". */
     isAnnual: boolean;
+    /** #203: the attached volume (annual one-off, collected edition) the group lives in, or null for
+     *  the main run. An attached lane is its own numbering domain — seven annual volumes on one
+     *  series each own a "#1", and those are seven comics, not one duplicate group (anacronismo,
+     *  2026-09-13: the resolver offered "Delete 6 in this group" across them). */
+    attachedVolumeId: string | null;
+    /** The lane's own name, so the resolver can say WHICH "#1" — "The Amazing Spider-Man '96 · Annual #1". */
+    laneName: string | null;
+    /** ANNUAL | COLLECTED for a lane group (a collected book reads "Vol. N"), null for the main run. */
+    laneKind: string | null;
     files: DuplicateFile[];
     /** True when the group's filenames disagree about which issue they are (issue #196): two
      *  DIFFERENT comics are wearing the same DB number — a metadata mispair, not a real duplicate.
@@ -51,9 +60,11 @@ export async function findDuplicateGroups(): Promise<DuplicateGroup[]> {
     // instead of hydrating every downloaded issue (+ its full Series row) into Node. This health check
     // runs every 15 min, so on a 100k-issue library the old full scan moved hundreds of MB each time.
     // #203: isAnnual is part of the grouping key — "Batman Annual #1" beside "Batman #1" is a
-    // co-located annual, not a duplicate.
+    // co-located annual, not a duplicate. So is the attached lane: every attached volume numbers
+    // its own issues (the series page has keyed them `att:<lane>:<n>` since beta.010), and seven
+    // annual volumes' "#1" files on one series are seven comics.
     const candidates = await prisma.issue.groupBy({
-        by: ['seriesId', 'number', 'isAnnual'],
+        by: ['seriesId', 'number', 'isAnnual', 'attachedVolumeId'],
         where: { filePath: { not: null } },
         _count: { seriesId: true },
         having: { seriesId: { _count: { gt: 1 } } },
@@ -66,16 +77,19 @@ export async function findDuplicateGroups(): Promise<DuplicateGroup[]> {
     const issues = await prisma.issue.findMany({
         where: { filePath: { not: null }, seriesId: { in: seriesIds } },
         select: {
-            id: true, number: true, isAnnual: true, seriesId: true, filePath: true,
+            id: true, number: true, isAnnual: true, seriesId: true, filePath: true, attachedVolumeId: true,
             series: { select: { name: true, metadataId: true, metadataSource: true } },
+            attachedVolume: { select: { name: true, kind: true } },
         },
     });
 
-    // Group by (series, annual domain, issue number) in memory first — cheap, no filesystem access.
+    // Group by (series, lane, annual domain, issue number) in memory first — cheap, no filesystem
+    // access. The lane has to be in THIS key too: one real duplicate in one lane makes the whole
+    // series a candidate, and every lane's rows come back from the query above.
     const groups = new Map<string, any[]>();
     for (const issue of issues) {
         if (!issue.filePath) continue;
-        const key = `${issue.seriesId}_${issue.isAnnual ? 'annual' : 'issue'}_${issue.number}`;
+        const key = `${issue.seriesId}_${issue.attachedVolumeId || ''}_${issue.isAnnual ? 'annual' : 'issue'}_${issue.number}`;
         if (!groups.has(key)) groups.set(key, []);
         groups.get(key)!.push(issue);
     }
@@ -109,6 +123,9 @@ export async function findDuplicateGroups(): Promise<DuplicateGroup[]> {
             seriesMetadataSource: present[0].series?.metadataSource ?? null,
             issueNumber: present[0].number,
             isAnnual: present[0].isAnnual ?? false,
+            attachedVolumeId: present[0].attachedVolumeId ?? null,
+            laneName: present[0].attachedVolumeId ? (present[0].attachedVolume?.name || null) : null,
+            laneKind: present[0].attachedVolumeId ? (present[0].attachedVolume?.kind || null) : null,
             files,
             suspectedMispair: filenamesDisagree(files.map(f => f.parsedNumber)),
         });

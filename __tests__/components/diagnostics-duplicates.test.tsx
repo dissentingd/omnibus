@@ -129,3 +129,55 @@ describe('Duplicate Resolver mispair guard (issue #196)', () => {
         expect(within(mispairCard).getByRole('button', { name: /Delete 1 in this group/i })).toBeEnabled();
     });
 });
+
+// #203 round 3: a group inside an attached lane says WHICH lane — "The Amazing Spider-Man '96 ·
+// Annual #1" — and two lanes' groups that share a series and a number are two groups with their
+// own keeper selections, never one radio set.
+describe('Duplicate Resolver attached lanes (#203)', () => {
+    const laneGroup = (laneId: string, laneName: string, prefix: string) => ({
+        seriesId: 's-asm',
+        seriesName: 'The Amazing Spider-Man',
+        seriesMetadataId: '2127',
+        seriesMetadataSource: 'COMICVINE',
+        issueNumber: '1',
+        isAnnual: true,
+        attachedVolumeId: laneId,
+        laneName,
+        laneKind: 'ANNUAL',
+        suspectedMispair: false,
+        files: [
+            { id: `${prefix}-small`, path: `/comics/Marvel/ASM/${laneName} #001.cbz`, name: `${laneName} #001.cbz`, size: 10 * 1024 * 1024, parsedNumber: '1' },
+            { id: `${prefix}-large`, path: `/comics/Marvel/ASM/${laneName} #01 (digital).cbz`, name: `${laneName} #01 (digital).cbz`, size: 20 * 1024 * 1024, parsedNumber: '1' },
+        ],
+    });
+
+    beforeEach(() => {
+        fetchMock.mockImplementation(async (url: string, init?: any) => {
+            if (url === '/api/admin/diagnostics' && JSON.parse(init?.body || '{}').action === 'scan-duplicates') {
+                return { ok: true, json: async () => ({ duplicates: [
+                    laneGroup('v60438', "The Amazing Spider-Man '96", 'a96'),
+                    laneGroup('v60440', "The Amazing Spider-Man '97", 'a97'),
+                ] }) };
+            }
+            return { ok: true, json: async () => ({}) };
+        });
+    });
+
+    it('names the lane on each group and keeps their keeper selections apart', async () => {
+        await openDuplicatesTab();
+
+        expect(screen.getByText("The Amazing Spider-Man '96 · Annual #1")).toBeInTheDocument();
+        expect(screen.getByText("The Amazing Spider-Man '97 · Annual #1")).toBeInTheDocument();
+
+        // Both groups start with their largest copy kept.
+        expect(screen.getAllByText(/^Keep$/)).toHaveLength(2);
+        // "Delete all copies" on the '96 group leaves the '97 group's keeper untouched.
+        const card96 = screen.getByText("The Amazing Spider-Man '96 · Annual #1").closest('div.rounded-lg') as HTMLElement;
+        fireEvent.click(within(card96).getByLabelText(/Delete all copies/i));
+        expect(within(card96).queryByText(/^Keep$/)).not.toBeInTheDocument();
+        expect(within(card96).getByRole('button', { name: /Delete 2 in this group/i })).toBeEnabled();
+        const card97 = screen.getByText("The Amazing Spider-Man '97 · Annual #1").closest('div.rounded-lg') as HTMLElement;
+        expect(within(card97).getByText(/^Keep$/)).toBeInTheDocument();
+        expect(within(card97).getByRole('button', { name: /Delete 1 in this group/i })).toBeEnabled();
+    });
+});

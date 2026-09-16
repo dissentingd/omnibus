@@ -10,9 +10,16 @@ import { Loader2, ShieldAlert, Ghost, FileQuestion, FileWarning, Trash2, CheckCi
 import Link from "next/link"
 import { ConfirmationDialog } from "@/components/ui/confirmation-dialog"
 
-// Stable key per duplicate group. seriesId + issue number identifies the group; the index keeps it
-// unique even in the impossible event of a collision.
-const groupKey = (g: any, idx: number) => `${g.seriesId}_${g.issueNumber}_${idx}`;
+// Stable key per duplicate group. seriesId + attached lane + issue number identifies the group (#203:
+// two annual volumes on one series each own a "#1"); the index keeps it unique even in the
+// impossible event of a collision.
+const groupKey = (g: any, idx: number) => `${g.seriesId}_${g.attachedVolumeId || ''}_${g.issueNumber}_${idx}`;
+// What a group is called: "Annual #1", "Vol. 2" for a collected book, prefixed with the attached
+// volume's own name when the group lives in one — "The Amazing Spider-Man '96 · Annual #1".
+const groupLabel = (g: any) => {
+    const domain = g.laneKind === 'COLLECTED' ? 'Vol.' : g.isAnnual ? 'Annual' : 'Issue';
+    return `${g.laneName ? `${g.laneName} · ` : ''}${domain} #${g.issueNumber}`;
+};
 const DELETE_ALL = '__DELETE_ALL__';
 // "Keep every copy" selection state — nothing in the group is deleted. The default for groups the
 // detector flags as suspected metadata mispairs (issue #196: files 001 and 004 sharing one DB
@@ -432,7 +439,7 @@ export default function DiagnosticsPage() {
                                 return (
                                     <div key={key} className={`bg-muted/30 border rounded-lg p-4 ${mispair ? 'border-amber-500/40' : 'border-border'}`}>
                                         <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
-                                            <h4 className="font-bold text-foreground">{group.seriesName} <Badge variant="secondary">{group.isAnnual ? 'Annual' : 'Issue'} #{group.issueNumber}</Badge>
+                                            <h4 className="font-bold text-foreground">{group.seriesName} <Badge variant="secondary">{groupLabel(group)}</Badge>
                                                 {mispair && <Badge variant="outline" className="ml-1 border-amber-500/60 text-amber-500"><AlertTriangle className="w-3 h-3 mr-1" /> Suspected mispair</Badge>}
                                             </h4>
                                             <div className="flex items-center gap-3">
@@ -506,7 +513,7 @@ export default function DiagnosticsPage() {
                                         <div className="flex justify-end mt-3">
                                             <Button size="sm" variant="destructive" disabled={isResolving || deleteCount === 0} onClick={() => {
                                                 const ids = idsToDeleteFor(group, key);
-                                                setPendingDelete({ ids, label: `Delete ${ids.length} copy/copies of ${group.seriesName} #${group.issueNumber}${keepId === DELETE_ALL ? ' (keeping none)' : ', keeping the selected copy'}?` });
+                                                setPendingDelete({ ids, label: `Delete ${ids.length} copy/copies of ${group.seriesName} ${groupLabel(group)}${keepId === DELETE_ALL ? ' (keeping none)' : ', keeping the selected copy'}?` });
                                             }}>
                                                 <Trash2 className="w-4 h-4 mr-2" /> Delete {deleteCount} in this group
                                             </Button>
