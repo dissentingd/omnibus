@@ -354,6 +354,11 @@ export async function GET(request: Request) {
                 // #203 Phase 1: which attached volume this annual belongs to (null = none yet), so
                 // the Annuals panel can tell "claimed" apart from "still on its own".
                 attachedVolumeId: (issue as any).attachedVolumeId ?? null,
+                // #203 round 3: an attached row names its volume on the page ("The Amazing
+                // Spider-Man '96 · Annual #1") — seven volumes' "#1" were indistinguishable.
+                attachmentName: (issue as any).attachedVolumeId ? ((issue as any).attachedVolume?.name ?? null) : null,
+                // Sorting by release date on the page (annuals fall in between the issues).
+                releaseDate: issue.releaseDate ?? null,
                 isCollected,
                 collectionName: isCollected ? (issue as any).attachedVolume?.name ?? null : null,
                 // #203 COLLECTED coverage: which run issues this book reprints ("1-6, 8"), books only.

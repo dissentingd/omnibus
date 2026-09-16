@@ -127,6 +127,28 @@ describe('#203 beta.010 regression: attached-lane rows vs. the folder file sync'
         expect(rows[0]).toEqual(expect.objectContaining({ number: '1', isAnnual: true, filePath: expect.stringContaining("'96 #001") }));
     });
 
+    // #203 round 3: the page labels an attached row with its volume's name and can sort by release
+    // date, so both ride on every issue row — the lane's name for attached rows only.
+    it('carries the attached volume\'s name and the release date on each issue row', async () => {
+        const ASM = '/comics/ASM';
+        (prisma.series.findFirst as any).mockResolvedValue({
+            id: 's1', name: 'The Amazing Spider-Man', year: 1963, folderPath: ASM, metadataId: '2350', metadataSource: 'COMICVINE',
+        });
+        (prisma.attachedVolume.findMany as any).mockResolvedValue([{ id: 'att96', name: "The Amazing Spider-Man '96", kind: 'ANNUAL' }]);
+        (prisma.issue.findMany as any).mockResolvedValue([
+            { id: 'main1', number: '1', isAnnual: false, metadataId: '300001', releaseDate: '1963-03-01', filePath: `${ASM}/The Amazing Spider-Man #001 (1963).cbz`, attachedVolumeId: null, attachedVolume: null },
+            { id: 'a96', number: '1', isAnnual: true, metadataId: '143308', releaseDate: '1996-11-01', filePath: `${ASM}/The Amazing Spider-Man '96 #001 (1996).cbz`, attachedVolumeId: 'att96', attachedVolume: { kind: 'ANNUAL', name: "The Amazing Spider-Man '96" } },
+            { id: 'loose', number: '2', isAnnual: true, metadataId: 'unmatched_x', releaseDate: null, filePath: `${ASM}/The Amazing Spider-Man Annual #002 (1965).cbz`, attachedVolumeId: null, attachedVolume: null },
+        ]);
+        disk.files = ['The Amazing Spider-Man #001 (1963).cbz', "The Amazing Spider-Man '96 #001 (1996).cbz", 'The Amazing Spider-Man Annual #002 (1965).cbz'];
+
+        const body = await (await GET(getReq(`http://localhost/api/library/series?path=${encodeURIComponent(ASM)}`))).json();
+        const byId = Object.fromEntries(body.downloadedIssues.map((i: any) => [i.id, i]));
+        expect(byId.main1).toEqual(expect.objectContaining({ attachmentName: null, releaseDate: '1963-03-01', isAnnual: false }));
+        expect(byId.a96).toEqual(expect.objectContaining({ attachmentName: "The Amazing Spider-Man '96", releaseDate: '1996-11-01', isAnnual: true, attachedVolumeId: 'att96' }));
+        expect(byId.loose).toEqual(expect.objectContaining({ attachmentName: null, releaseDate: null, isAnnual: true }));
+    });
+
     // #203 COLLECTED coverage walk (2026-09-15): an OWNED trade in a lane named like its parent — the
     // usual shape of a provider's "collected editions" volume — can't be name-claimed, so its file
     // parsed as run #3 and the page flagged it as a duplicate of issue #3. A file that already

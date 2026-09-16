@@ -2,6 +2,8 @@
 "use client"
 
 import { useState, useEffect, useTransition, Suspense, useMemo, type SyntheticEvent } from "react"
+import { IssueSortControl } from "@/components/issue-sort-control"
+import { sortIssuesForDisplay, laneLabel, parseIssueSortMode, DEFAULT_ISSUE_SORT, ISSUE_SORT_STORAGE_KEY, type IssueSortMode } from "@/lib/utils/issue-sort"
 import { useSearchParams, useRouter } from "next/navigation"
 import { useSession } from "next-auth/react"
 import { Button } from "@/components/ui/button"
@@ -73,6 +75,9 @@ function SeriesContent() {
   
   const [loading, setLoading] = useState(true);
   const [viewMode, setViewMode] = useState<'grid' | 'list'>('grid');
+  // #203 round 3: the issue lists' order — by number (the run, then the annuals) or by release
+  // date (annuals fall in between). One remembered choice for every series page, like the view.
+  const [sortMode, setSortMode] = useState<IssueSortMode>(DEFAULT_ISSUE_SORT);
 
   const [downloadedIssues, setDownloadedIssues] = useState<any[]>([]);
   const [missingIssues, setMissingIssues] = useState<any[]>([]);
@@ -277,12 +282,24 @@ function SeriesContent() {
     document.title = "Omnibus - Series";
     const savedView = localStorage.getItem('omnibus-series-view') as 'grid' | 'list';
     if (savedView === 'grid' || savedView === 'list') setViewMode(savedView);
+    try {
+        const savedSort = parseIssueSortMode(localStorage.getItem(ISSUE_SORT_STORAGE_KEY));
+        if (savedSort) setSortMode(savedSort);
+    } catch { /* private mode */ }
   }, [loading]);
 
   const toggleViewMode = (mode: 'grid' | 'list') => {
       setViewMode(mode);
       localStorage.setItem('omnibus-series-view', mode);
   };
+
+  const changeSortMode = (mode: IssueSortMode) => {
+      setSortMode(mode);
+      try { localStorage.setItem(ISSUE_SORT_STORAGE_KEY, mode); } catch { /* private mode */ }
+  };
+
+  const sortedDownloaded = useMemo(() => sortIssuesForDisplay(downloadedIssues, sortMode), [downloadedIssues, sortMode]);
+  const sortedMissing = useMemo(() => sortIssuesForDisplay(missingIssues, sortMode), [missingIssues, sortMode]);
 
   useEffect(() => {
     if (!folderPath) return;
@@ -1825,6 +1842,7 @@ function SeriesContent() {
                   <div className="flex items-center justify-between border-b-2 border-border pb-4">
                       <h4 className="font-black flex items-center gap-2 text-xl text-foreground tracking-tight"><Layers className="w-6 h-6 text-primary"/> Downloaded Issues ({downloadedIssues.length})</h4>
                       <div className="flex items-center gap-2 shrink-0">
+                      <IssueSortControl value={sortMode} onChange={changeSortMode} />
                       {canDownload && downloadedIssues.some(i => i.fullPath) && (
                           <Button
                               size="sm"
@@ -1852,7 +1870,7 @@ function SeriesContent() {
 
                   {viewMode === 'grid' ? (
                       <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-1 lg:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4 gap-6 pb-4">
-                          {downloadedIssues.map((issue) => {
+                          {sortedDownloaded.map((issue) => {
                               const isSelected = activeIssue?.id === issue.id || selectedIssues.has(issue.id);
                               const isRead = issue.isRead || (issue.readProgress || 0) >= 100;
                               return (
@@ -1881,7 +1899,7 @@ function SeriesContent() {
                                       {issue.readProgress > 0 && !isRead && <div className="absolute bottom-0 left-0 right-0 h-1.5 bg-black/50"><div className="h-full bg-primary" style={{ width: `${issue.readProgress}%` }} /></div>}
                                     </div>
                                     <div className="flex flex-col justify-between flex-1 py-1 min-w-0">
-                                      <div><h5 className={cn("font-bold text-base line-clamp-2 leading-tight", isRead ? 'text-muted-foreground' : 'text-foreground')}>{issue.name}</h5>{issue.parsedNum !== null && <span className="text-[10px] mt-1 font-black text-muted-foreground uppercase tracking-widest">{issue.isAnnual ? 'Annual' : 'Issue'} #{issue.parsedNum}</span>}</div>
+                                      <div><h5 className={cn("font-bold text-base line-clamp-2 leading-tight", isRead ? 'text-muted-foreground' : 'text-foreground')}>{issue.name}</h5>{issue.parsedNum !== null && <span className="text-[10px] mt-1 font-black text-muted-foreground uppercase tracking-widest">{laneLabel(issue)} #{issue.parsedNum}</span>}</div>
                                       <div className="flex flex-wrap items-center gap-1.5 mt-3">
                                         <Button size="sm" variant={isSelected && !isSelectionMode ? "default" : "outline"} className="flex-1 font-bold shadow-md min-w-[70px]" asChild onClick={(e) => { if (isSelectionMode) { e.preventDefault(); } else { e.stopPropagation(); } }}>
                                             <Link href={`/reader?path=${encodeURIComponent(issue.fullPath)}&series=${encodeURIComponent(folderPath || '')}`}>
@@ -1928,7 +1946,7 @@ function SeriesContent() {
                                       </tr>
                                   </thead>
                                   <tbody className="divide-y divide-border">
-                                      {downloadedIssues.map((issue) => {
+                                      {sortedDownloaded.map((issue) => {
                                           const isSelected = activeIssue?.id === issue.id || selectedIssues.has(issue.id);
                                           const isRead = issue.isRead || (issue.readProgress || 0) >= 100;
                                           return (
@@ -1959,7 +1977,7 @@ function SeriesContent() {
                                                   </td>
                                                   <td className="px-4 py-3 font-bold">
                                                       <div className={cn("line-clamp-2 leading-tight", isRead ? 'text-muted-foreground' : 'text-foreground')}>{issue.name}</div>
-                                                      {issue.parsedNum !== null && <div className="text-[10px] mt-1 font-black text-muted-foreground uppercase tracking-widest">{issue.isAnnual ? 'Annual' : 'Issue'} #{issue.parsedNum}</div>}
+                                                      {issue.parsedNum !== null && <div className="text-[10px] mt-1 font-black text-muted-foreground uppercase tracking-widest">{laneLabel(issue)} #{issue.parsedNum}</div>}
                                                   </td>
                                                   <td className="px-4 py-3 text-center">
                                                       {isRead ? <Badge className="bg-green-600 border-0 text-[9px] px-1 h-4"><Check className="w-3 h-3 mr-1"/> Read</Badge> : issue.readProgress > 0 ? <Badge className="bg-primary border-0 text-primary-foreground text-[9px] px-1 h-4">{Math.round(issue.readProgress)}%</Badge> : <span className="text-muted-foreground text-xs">-</span>}
@@ -2052,14 +2070,14 @@ function SeriesContent() {
                           </div>
                       ) : viewMode === 'grid' ? (
                           <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-1 lg:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4 gap-6 pb-10">
-                              {missingIssues.map((issue) => {
+                              {sortedMissing.map((issue) => {
                                   const isRequesting = requestingIds.has(issue.id);
                                   const isAlreadyRequested = requestedIds.has(issue.id);
                                   return (
                                       <div key={issue.id} onClick={() => setActiveIssue(issue)} className="flex gap-4 p-4 bg-muted/30 border border-border/50 rounded-xl shadow-sm opacity-80 hover:opacity-100 transition-all cursor-pointer">
                                         <div className="w-20 h-28 shrink-0 rounded-md overflow-hidden bg-muted border border-border grayscale">{issue.coverUrl || seriesInfo.cover ? <img src={issue.coverUrl || seriesInfo.cover} onError={coverImgError(seriesInfo.cover)} className="w-full h-full object-cover" alt="" /> : <ImageIcon className="w-8 h-8 m-auto mt-10 text-muted-foreground/50" />}</div>
                                         <div className="flex flex-col justify-between flex-1 py-1 min-w-0">
-                                            <div><h5 className="font-bold text-base line-clamp-2 text-foreground leading-tight">{issue.name}</h5><span className="text-[10px] mt-1 font-black text-muted-foreground uppercase tracking-widest">{issue.isAnnual ? 'Annual' : 'Issue'} #{issue.parsedNum}</span></div>
+                                            <div><h5 className="font-bold text-base line-clamp-2 text-foreground leading-tight">{issue.name}</h5><span className="text-[10px] mt-1 font-black text-muted-foreground uppercase tracking-widest">{laneLabel(issue)} #{issue.parsedNum}</span></div>
                                             <div className="flex flex-wrap items-center gap-2 mt-3">{isAlreadyRequested ? <Button size="sm" variant="secondary" disabled className="flex-1 h-9 bg-green-50 text-green-700 dark:bg-green-900/20 border-green-200 opacity-100 cursor-not-allowed"><Check className="w-4 h-4 mr-2"/> Queued</Button> : <Button size="sm" variant="outline" className="flex-1 h-9 font-black text-[10px] border-border hover:bg-muted uppercase tracking-wider min-w-[80px]" onClick={(e) => { e.stopPropagation(); handleRequestMissing(issue); }} disabled={isRequesting}>{isRequesting ? <Loader2 className="w-4 h-4 animate-spin mr-2"/> : <CloudDownload className="w-4 h-4 mr-2"/>}Request</Button>}</div>
                                         </div>
                                       </div>
@@ -2078,7 +2096,7 @@ function SeriesContent() {
                                           </tr>
                                       </thead>
                                       <tbody className="divide-y divide-border">
-                                          {missingIssues.map((issue) => {
+                                          {sortedMissing.map((issue) => {
                                               const isRequesting = requestingIds.has(issue.id);
                                               const isAlreadyRequested = requestedIds.has(issue.id);
                                               return (
@@ -2090,7 +2108,7 @@ function SeriesContent() {
                                                       </td>
                                                       <td className="px-4 py-3 font-bold">
                                                           <div className="line-clamp-2 leading-tight text-foreground">{issue.name}</div>
-                                                          {issue.parsedNum !== null && <div className="text-[10px] mt-1 font-black text-muted-foreground uppercase tracking-widest">{issue.isAnnual ? 'Annual' : 'Issue'} #{issue.parsedNum}</div>}
+                                                          {issue.parsedNum !== null && <div className="text-[10px] mt-1 font-black text-muted-foreground uppercase tracking-widest">{laneLabel(issue)} #{issue.parsedNum}</div>}
                                                       </td>
                                                       <td className="px-4 py-3 text-right">
                                                           {isAlreadyRequested ? (
