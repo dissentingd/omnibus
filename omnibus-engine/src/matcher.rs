@@ -107,11 +107,19 @@ pub async fn record_sweep_result(db: &Db, value: serde_json::Value) {
 /// said "I curated this by hand, stop offering to match it" — but such a series still has a null or
 /// placeholder metadataId, so without this clause the very next sweep would pick it up and
 /// auto-match it anyway, which is precisely the nagging the state exists to end.
+///
+/// FIX (sweep-tiebreak-stall): a batch operation (e.g. a container restart's own DB Init
+/// migration) can bump "updatedAt" on hundreds/thousands of rows to the exact same millisecond.
+/// With no secondary sort key, ORDER BY "updatedAt" ASC LIMIT 100 was resampling an arbitrary,
+/// inconsistent slice of that tied group every run instead of deterministically working through
+/// it -- series with no file evidence never got surfaced-and-cleared, so runs looked erratic
+/// (e.g. 53/50/0/0/46/0 matched back to back) even though nothing was actually broken. "id" is
+/// stable and arbitrary but consistent, which is all a tiebreaker needs to be.
 pub(crate) fn unmatched_candidates_sql() -> &'static str {
     r#"SELECT id, name, year, "folderPath" FROM "Series"
        WHERE ("matchState" IS NULL OR "matchState" <> 'IGNORED')
          AND ("matchState" = 'UNMATCHED' OR "metadataId" IS NULL OR "metadataId" LIKE 'unmatched%')
-       ORDER BY "updatedAt" ASC LIMIT 100"#
+       ORDER BY "updatedAt" ASC, "id" ASC LIMIT 100"#
 }
 
 pub async fn run_unmatched_sweep(db: Db) -> anyhow::Result<SweepOutcome> {
