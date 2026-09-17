@@ -421,10 +421,15 @@ export default function SmartMatchPage() {
         let matchCount = 0;
 
         for (const series of visibleUnmatched) {
-            if (suggestions[series.id]) continue;
             // An ignored series is visible only while the toggle is on; scanning it would put a
             // suggestion back on a row the admin has already dealt with.
             if (series.isIgnored) continue;
+            // FIX (autoscan-retry-gap): skipping on any truthy cached value meant a series that came
+            // back NOT_FOUND or ERROR earlier in this tab's session got silently skipped by every
+            // later click forever (session-scoped cache, 12h TTL) -- it never became a reviewable
+            // suggestion, but the scan also never tried it again. Only a real candidate object should
+            // count as "already handled"; the sentinel strings should still be retried.
+            if (suggestions[series.id] && typeof suggestions[series.id] === 'object') continue;
 
             try {
                 // The search term is the SERIES, not the file: a loose file arrives as its filename
