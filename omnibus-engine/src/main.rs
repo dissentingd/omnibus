@@ -403,9 +403,20 @@ fn main() -> anyhow::Result<()> {
     }
 
     // Build the real multi-threaded runtime with the configured CPU + blocking-pool caps.
+    //
+    // FIX (scan-stack-overflow): neither worker nor blocking threads had an explicit stack size,
+    // so both pools ran on Tokio's own built-in default -- easy to exceed during a large library
+    // scan (many folders parsed concurrently via spawn_blocking, each doing ComicInfo.xml/zip
+    // parsing with serde-derive-generated call depth). Hit live: `fatal runtime error: stack
+    // overflow, aborting` mid-scan, twice in a row, on a ~55k-file / 55k-issue library.
+    // RUST_MIN_STACK does NOT help here -- it's only consulted when a thread's stack size is left
+    // unset, and Tokio's builder always sets one. 16 MiB is a generous, standard bump for this
+    // class of crash (default is typically 2 MiB); it costs a little memory per thread, nothing
+    // else changes if the crash wasn't actually about stack size.
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(cfg.cpu_cap)
         .max_blocking_threads(cfg.blocking_threads)
+        .thread_stack_size(16 * 1024 * 1024)
         .enable_all()
         .build()?;
 
