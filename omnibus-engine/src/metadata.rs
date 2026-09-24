@@ -155,6 +155,14 @@ async fn stamp_credits_synced_in(tx: &mut sqlx::Transaction<'_, sqlx::Any>, db: 
     .map(|_| ())
 }
 
+/// ComicVine signals its velocity/burst block with HTTP 420 (not 429). Treating only 429 as a rate
+/// limit meant a 420 fell through to a JSON-parse error, was counted as a plain per-series failure,
+/// and the batch kept hammering the API instead of halting. The bail message keeps the "429" token
+/// the batch-halt check matches on.
+pub(crate) fn is_cv_rate_limited(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.as_u16() == 420
+}
+
 /// One ComicVine volume GET through the shared response cache — usage-logged, and 429-flagged,
 /// only on a real upstream call. `field_list` is part of the cache key, so asking for new fields
 /// is a fresh fetch rather than a stale hit.
@@ -653,7 +661,7 @@ async fn fetch_comicvine(
     if let Some(arr) = vol_data["concepts"].as_array() {
         for c in arr {
             if let Some(n) = c["name"].as_str() {
-                if !n.is_empty() && !vol_genres.contains(&n.to_string()) {
+                if is_real_genre(n) && !vol_genres.contains(&n.to_string()) {
                     vol_genres.push(n.to_string());
                 }
             }
@@ -954,7 +962,10 @@ async fn fetch_comicvine(
             // #199 round 3: shared resolver — a null/generic provider name can no longer wipe a
             // real story title; lock + file-priority semantics unchanged (Node parity).
             let name_val = resolve_synced_name(existing_name, cv_name, &issue_num, is_locked, file_priority);
-            let release_val = if is_locked { existing_release } else { issue_date.clone() };
+            // file_metadata_priority: a release date already on the row (read from ComicInfo.xml at scan)
+            // is kept; the provider only fills a blank. ComicVine's store date otherwise silently
+            // replaces the file's cover date, shifting Month/Day (and Year across a year boundary).
+            let release_val = prefer_existing(existing_release, issue_date.clone(), is_locked, file_priority);
             // A locked (manually edited) issue keeps its description; file-priority keeps a non-empty
             // ComicInfo-derived one; otherwise take the provider's.
             let desc_val = prefer_existing(existing_desc, cv_desc.clone(), is_locked, file_priority);
@@ -1456,7 +1467,7 @@ async fn fetch_metron(
         // resolver lets them fill blanks but never clobber a real story title that the detail
         // pass (or a ComicInfo read) already landed. Lock + file priority unchanged.
         let name_val: Option<String> = resolve_synced_name(existing_name, Some(issue_name), &issue_num, is_locked, file_priority);
-        let release_val: Option<String> = if is_locked { existing_release } else { issue_date.clone() };
+        let release_val: Option<String> = prefer_existing(existing_release, issue_date.clone(), is_locked, file_priority);
         // A custom issue cover (set in the Smart Matcher) survives every sync; else the provider's wins.
         let cover_val: Option<String> = if has_custom_cover { existing_cover } else { issue_cover.clone() };
 
@@ -1943,6 +1954,19 @@ pub(crate) fn is_cv_rate_limited(status: reqwest::StatusCode) -> bool {
 /// MATCHED as before (issue #179).
 pub(crate) fn next_match_state(existing: Option<String>) -> &'static str {
     if existing.as_deref() == Some("DEEP_SYNCED") { "DEEP_SYNCED" } else { "MATCHED" }
+}
+
+/// ComicVine "concepts" are a free-form tag cloud ("Variant Cover: Action Figure", "Homage Covers",
+/// event and character-trait tags), not genres. Only a concept that is a recognised genre name is
+/// promoted to Series/Issue genres; everything else would pollute <Genre> in every embedded file.
+pub(crate) fn is_real_genre(name: &str) -> bool {
+    const GENRES: &[&str] = &[
+        "action", "adventure", "alternate history", "anthology", "biography", "comedy", "crime",
+        "cyberpunk", "drama", "espionage", "fantasy", "historical", "horror", "humor", "mystery",
+        "noir", "post-apocalyptic", "romance", "satire", "science fiction", "slice of life",
+        "sports", "superhero", "supernatural", "survival", "thriller", "war", "western", "zombies",
+    ];
+    GENRES.contains(&name.trim().to_ascii_lowercase().as_str())
 }
 
 /// Column-write policy for provider credit syncs (issue #179): a locked (hasCustomMetadata) issue
@@ -2623,6 +2647,31 @@ mod tests {
         assert_eq!(next_match_state(Some("MATCHED".to_string())), "MATCHED");
         assert_eq!(next_match_state(Some("UNMATCHED".to_string())), "MATCHED");
         assert_eq!(next_match_state(None), "MATCHED");
+    }
+
+    #[test]
+    fn cv_velocity_block_420_counts_as_rate_limited() {
+        assert!(is_cv_rate_limited(reqwest::StatusCode::from_u16(420).unwrap()));
+        assert!(is_cv_rate_limited(reqwest::StatusCode::TOO_MANY_REQUESTS));
+        assert!(!is_cv_rate_limited(reqwest::StatusCode::OK));
+    }
+
+    #[test]
+    fn is_real_genre_rejects_cv_concept_noise() {
+        assert!(is_real_genre("Superhero"));
+        assert!(is_real_genre(" science fiction "));
+        assert!(!is_real_genre("Variant Cover: Action Figure"));
+        assert!(!is_real_genre("Homage Covers"));
+        assert!(!is_real_genre(""));
+    }
+
+    #[test]
+    fn release_date_is_fill_only_under_file_priority() {
+        let file = Some("2017-06-30".to_string());
+        let provider = Some("2017-04-19".to_string());
+        assert_eq!(prefer_existing(file.clone(), provider.clone(), false, true), file);
+        assert_eq!(prefer_existing(None, provider.clone(), false, true), provider);
+        assert_eq!(prefer_existing(file.clone(), provider.clone(), false, false), provider);
     }
 
     #[test]
