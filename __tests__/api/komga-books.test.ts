@@ -511,13 +511,13 @@ describe('Komga facade: every error is a Komga JSON body', () => {
     });
 
     it('an unknown /komga/api/v1 path answers a JSON 404 for any method, not the HTML not-found page', async () => {
-        const get = await catchAllGet(req('/books/list'));
-        expect((await errorBody(get, 404)).path).toBe('/api/v1/books/list');
-        await errorBody(await catchAllPost(req('/books/list', { method: 'POST', body: '{}' })), 404);
+        const get = await catchAllGet(req('/readlists'));
+        expect((await errorBody(get, 404)).path).toBe('/api/v1/readlists');
+        await errorBody(await catchAllPost(req('/readlists/list', { method: 'POST', body: '{}' })), 404);
     });
 
-    it('a POST that lands on the series/{id} segment (a newer client\'s /series/list) is a JSON 405, not an empty body', async () => {
-        const res = await postSeriesOne(req('/series/list', { method: 'POST', body: '{}' }));
+    it('a POST that lands on the series/{id} segment is a JSON 405, not an empty body', async () => {
+        const res = await postSeriesOne(req('/series/ser_1', { method: 'POST', body: '{}' }));
         expect((await errorBody(res, 405)).error).toBe('Method Not Allowed');
     });
 });

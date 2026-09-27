@@ -16,8 +16,8 @@ export async function GET(req: Request, { params }: { params: Promise<{ id: stri
     });
 }
 
-// Newer Komga clients POST /series/list (a search), which lands on this [id] segment; Next's own
-// 405 has an empty body the client can't parse. Answer it the Komga way instead (#206 round 4).
+// Any other method on this [id] segment: Next's own 405 has an empty body a client can't parse, so
+// answer it the Komga way instead (#206 round 4). (POST /series/list has its own static route.)
 export async function POST(req: Request) {
     return komgaError(405, new URL(req.url).pathname.replace(/^\/komga/, ''));
 }

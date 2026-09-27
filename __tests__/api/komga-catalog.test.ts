@@ -184,6 +184,8 @@ describe('Komga facade: GET /series (search + browse)', () => {
         expect(where).toContain('Superhero');
         expect(where).toContain('Event');
         expect(where).toContain('col_1');
+        // A collection filter only reaches the caller's OWN collections (#206: collections are per user).
+        expect(where).toContain('"collection":{"userId":"user_1"}');
         expect(call.orderBy[0]).toEqual({ createdAt: 'desc' });
         expect(call.skip).toBe(40);
         expect(call.take).toBe(40);

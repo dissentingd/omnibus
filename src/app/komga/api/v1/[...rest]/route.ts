@@ -1,9 +1,7 @@
 // src/app/komga/api/v1/[...rest]/route.ts — #206 Komga facade: every /komga/api/v1 path no route
 // answers. Next would render its HTML not-found page, which Paperback's source JSON.parses into an
-// error; a Komga-style JSON 404 parses, and the source shows nothing instead of failing. (Newer
-// Komga clients POST /books/list, which lands here, and /series/list, which the series/[id] route
-// answers with a JSON 405 — the facade doesn't serve either search yet.) Every specific route,
-// static or [id], takes precedence over this catch-all.
+// error; a Komga-style JSON 404 parses, and the source shows nothing instead of failing. Every
+// specific route, static or [id], takes precedence over this catch-all.
 import { komgaError } from '@/lib/komga/auth';
 
 export const dynamic = 'force-dynamic';
