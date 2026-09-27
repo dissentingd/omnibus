@@ -260,14 +260,19 @@ async function tileFor(row: ProgressWithIssue['issue'], progress: ProgressRow | 
     });
 }
 
-/** `/books?read_status=IN_PROGRESS&sort=readProgress.readDate,desc`: unfinished books, newest read first. */
-export async function inProgressBooks(userId: string, libs: AccessibleLibraries, page: number, size: number) {
-    const where: Prisma.ReadProgressWhereInput = {
+/** The user's started-but-unfinished books with files, inside their library grants. */
+function inProgressWhere(userId: string, libs: AccessibleLibraries): Prisma.ReadProgressWhereInput {
+    return {
         userId,
         isCompleted: false,
         currentPage: { gt: 0 },
         issue: { ...HAS_FILE, ...(nestedSeriesAccessWhere(libs) as Prisma.IssueWhereInput) },
     };
+}
+
+/** `/books?read_status=IN_PROGRESS&sort=readProgress.readDate,desc`: unfinished books, newest read first. */
+export async function inProgressBooks(userId: string, libs: AccessibleLibraries, page: number, size: number) {
+    const where = inProgressWhere(userId, libs);
     const [rows, total] = await Promise.all([
         prisma.readProgress.findMany({
             where,
@@ -320,4 +325,43 @@ export async function onDeckBooks(userId: string, libs: AccessibleLibraries, siz
         }));
     }
     return komgaPage(out, 0, size, out.length);
+}
+
+// ---------------------------------------------------------------------------------------------
+// View More for On Deck / Continue Reading (#206 round 4)
+// ---------------------------------------------------------------------------------------------
+// The source's getViewMoreItems asks for `/series/<section id>` for every homepage section and
+// reads SeriesDtos (it opens `/series/{id}/thumbnail` and the series itself), so On Deck and
+// Continue Reading are answered here as the series behind their books, in the section's order.
+
+/** How far back View More looks — the homepage sections themselves show 20. */
+const VIEW_MORE_CAP = 50;
+
+async function seriesPageFor(seriesIds: string[], userId: string, page: number, size: number) {
+    const slice = seriesIds.slice(page * size, page * size + size);
+    const found = slice.length ? await prisma.series.findMany({ where: { id: { in: slice } } }) : [];
+    const byId = new Map(found.map(s => [s.id, s]));
+    const rows = slice.map(id => byId.get(id)).filter((s): s is NonNullable<typeof s> => Boolean(s));
+    const counts = await seriesCounts(rows.map(r => r.id), userId);
+    const content = rows.map(r => toSeriesDto(r, counts.get(r.id) ?? ZERO_COUNTS, seriesAuthors(r)));
+    return komgaPage(content, page, size, seriesIds.length);
+}
+
+const distinct = (ids: string[]) => ids.filter((id, i) => ids.indexOf(id) === i);
+
+/** `/series/continue`: each series with an unfinished book, most recently read first. */
+export async function inProgressSeries(userId: string, libs: AccessibleLibraries, page: number, size: number) {
+    const rows = await prisma.readProgress.findMany({
+        where: inProgressWhere(userId, libs),
+        orderBy: { updatedAt: 'desc' },
+        take: VIEW_MORE_CAP,
+        select: { issue: { select: { seriesId: true } } },
+    });
+    return seriesPageFor(distinct(rows.map(r => r.issue.seriesId)), userId, page, size);
+}
+
+/** `/series/ondeck`: the series of the On Deck books, in On Deck order. */
+export async function onDeckSeries(userId: string, libs: AccessibleLibraries, page: number, size: number) {
+    const deck = await onDeckBooks(userId, libs, VIEW_MORE_CAP);
+    return seriesPageFor(distinct(deck.content.map(b => b.seriesId)), userId, page, size);
 }
