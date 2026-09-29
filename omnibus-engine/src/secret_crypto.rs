@@ -100,13 +100,6 @@ fn warn_if_undecryptable(decoded: Option<String>) -> Option<String> {
     decoded
 }
 
-/// Convenience wrapper for values pulled from a settings map (returns "" when absent/undecryptable).
-pub async fn decrypt_str(db: &sqlx::AnyPool, value: &str) -> String {
-    decrypt_setting(db, Some(value.to_string()))
-        .await
-        .unwrap_or_default()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -8,7 +8,6 @@ import { ComicVineVolume, FormattedSearchResult } from '@/types';
 import { Logger } from '@/lib/logger';
 import { getErrorMessage } from '@/lib/utils/error';
 import { MetronProvider } from '@/lib/metadata/providers/metron';
-import { logApiUsage } from '@/lib/utils/system-flags';
 import { cachedCvGet } from '@/lib/metadata/metadata-cache';
 
 const BASE_URL = 'https://comicvine.gamespot.com/api';
@@ -65,9 +64,9 @@ export async function GET(request: Request) {
 
     if (provider === 'METRON') {
         const metron = new MetronProvider();
+        // The shared Metron client counts every request it actually sends (cache hits aren't calls).
         const mdResults = await metron.searchSeries(query, page);
-        await logApiUsage('metron', '/search');
-        
+
         let results = mdResults.map((r: any) => ({
             id: r.sourceId,
             name: r.name,

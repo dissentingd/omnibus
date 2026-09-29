@@ -9,6 +9,7 @@ import { getErrorMessage } from './utils/error';
 import { MetronProvider } from './metadata/providers/metron';
 import { omnibusQueue } from './queue';
 import { markSystemFlag, countApiUsage } from './utils/system-flags';
+import { metronOptionalBudgetExhausted } from '@/lib/metron/client';
 import { cachedCvGet } from './metadata/metadata-cache';
 import { isSameIssue } from '@/lib/utils/issue-parser';
 import { resolveSyncedName, detailNameWrite } from '@/lib/utils/synced-name';
@@ -45,7 +46,7 @@ export async function syncSeriesMetadata(metadataId: string, folderPath: string,
 
     if (metadataSource === 'METRON') {
         try {
-            const metron = new MetronProvider();
+            const metron = new MetronProvider({ pace: 'background' });
             const details = await metron.getSeriesDetails(metadataId);
             
             if (!details) {
@@ -248,9 +249,10 @@ export async function syncSeriesMetadata(metadataId: string, folderPath: string,
                 };
                 let enriched = 0;
                 for (const candidate of candidates) {
-                    const used = await countApiUsage('metron');
-                    if (used + 500 >= 5000) {
-                        Logger.log(`[Metadata] Metron daily budget reached (${used} calls) — deferring credit enrichment for ${candidates.length - enriched} issue(s) of "${series.name}" to the next sync.`, 'info');
+                    // The account's real daily window (Metron's Sustained headers - the limit varies by
+                    // donor tier), keeping a reserve for normal syncing; our own count only as a fallback.
+                    if (await metronOptionalBudgetExhausted(await countApiUsage('metron'))) {
+                        Logger.log(`[Metadata] Metron daily budget nearly used — deferring credit enrichment for ${candidates.length - enriched} issue(s) of "${series.name}" to the next sync.`, 'info');
                         break;
                     }
                     try {
@@ -277,7 +279,7 @@ export async function syncSeriesMetadata(metadataId: string, folderPath: string,
                         });
                         enriched++;
                     } catch (e: any) {
-                        if (e.response?.status === 404) {
+                        if (e.status === 404 || e.response?.status === 404) {
                             // Gone from Metron — promote anyway so we never re-pay for the lookup.
                             await prisma.issue.update({ where: { id: candidate.id }, data: { matchState: 'DEEP_SYNCED' } }).catch(() => {});
                             continue;

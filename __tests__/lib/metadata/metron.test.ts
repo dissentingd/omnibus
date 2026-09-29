@@ -59,20 +59,18 @@ describe('Metadata Pipeline: Metron.Cloud Provider', () => {
         // First call returns 429 Too Many Requests, telling us to wait 1 second
         const headers = new Headers();
         headers.set('retry-after', '1');
-        
+
         vi.mocked(global.fetch)
             .mockResolvedValueOnce({ status: 429, headers, json: async () => ({}) } as any)
             .mockResolvedValueOnce({ status: 200, headers: new Headers(), json: async () => ({ results: [{ id: 1, series: 'Batman' }] }) } as any);
 
-        // Spy on global setTimeout
-        const setTimeoutSpy = vi.spyOn(global, 'setTimeout');
-
+        const started = Date.now();
         const results = await provider.searchSeries('Batman', 1);
 
         expect(results).toHaveLength(1);
-        expect(loggerLog).toHaveBeenCalledWith(expect.stringContaining('Rate Limit Hit'), 'warn');
-        
-        // Assert it waited 2 seconds (1 sec from header + 1 sec buffer) before retrying
-        expect(setTimeoutSpy).toHaveBeenCalledWith(expect.any(Function), 2000);
+        // The shared Metron client (src/lib/metron/client.ts) held the retry for the full Retry-After.
+        expect(loggerLog).toHaveBeenCalledWith(expect.stringContaining('Rate limited: waiting 1s'), 'warn');
+        expect(Date.now() - started).toBeGreaterThanOrEqual(1000);
+        expect(vi.mocked(global.fetch).mock.calls[1][0]).toContain('/series/?name=Batman');
     });
 });

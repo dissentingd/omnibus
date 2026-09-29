@@ -5,6 +5,7 @@
 // worker keeps request creation + searchAndDownload (BullMQ) + the Phase 3 UNRELEASED upgrade sweep.
 use anyhow::Result;
 use crate::db::Db;
+use crate::metron_client::MetronAuth;
 use sqlx::Row;
 use reqwest::Client;
 use serde::Serialize;
@@ -356,7 +357,7 @@ enum WalkOutcome {
 
 /// Walk a Metron series' issue_list within `budget` calls. OutOfBudget = stopped before the end
 /// (retried next run). Err = the request itself failed; the audit stops for this run.
-async fn walk_volume(db: &Db, client: &Client, auth: &(String, String), msid: &str, budget: usize, tally: &mut AuditTally) -> anyhow::Result<WalkOutcome> {
+async fn walk_volume(db: &Db, client: &Client, auth: &MetronAuth, msid: &str, budget: usize, tally: &mut AuditTally) -> anyhow::Result<WalkOutcome> {
     let mut url = Some(format!("https://metron.cloud/api/series/{}/issue_list/", msid));
     let mut own: HashSet<String> = HashSet::new();
     let (mut used, mut first) = (0usize, true);
@@ -391,7 +392,7 @@ async fn walk_volume(db: &Db, client: &Client, auth: &(String, String), msid: &s
 /// the same answer until the library changes.
 #[allow(clippy::too_many_arguments)]
 async fn audit_single(
-    db: &Db, client: &Client, auth: &(String, String), series: &[SeriesRec],
+    db: &Db, client: &Client, auth: &MetronAuth, series: &[SeriesRec],
     issues: &mut HashMap<String, Vec<IssueRec>>, strays: &mut StrayMap, m_id: &str, host_idx: usize, tally: &mut AuditTally,
 ) -> anyhow::Result<bool> {
     let url = format!("https://metron.cloud/api/issue/{}/", m_id);
@@ -424,7 +425,7 @@ async fn audit_single(
 /// Drain queued single checks within the budget. Err = Metron failed; the audit stops for this run.
 #[allow(clippy::too_many_arguments)]
 async fn drain_singles(
-    db: &Db, client: &Client, auth: &(String, String), series: &[SeriesRec],
+    db: &Db, client: &Client, auth: &MetronAuth, series: &[SeriesRec],
     issues: &mut HashMap<String, Vec<IssueRec>>, strays: &mut StrayMap, checked: &mut HashSet<String>,
     queue: &mut std::collections::VecDeque<(String, usize)>, tally: &mut AuditTally,
 ) -> anyhow::Result<()> {
@@ -443,7 +444,7 @@ async fn drain_singles(
 /// checks first, then Metron-sourced volumes' issue_list walks and the suspects they turn up.
 #[allow(clippy::too_many_arguments)]
 async fn stray_audit(
-    db: &Db, client: &Client, auth: &(String, String),
+    db: &Db, client: &Client, auth: &MetronAuth,
     series: &[SeriesRec], issues: &mut HashMap<String, Vec<IssueRec>>, strays: &mut StrayMap,
     seen: &HashSet<String>, checked: &mut HashSet<String>, notes: &mut Vec<String>,
 ) {
@@ -609,7 +610,7 @@ fn in_library_or_covered(issues: &[IssueRec], covered: Option<&Vec<String>>, num
 /// and emit candidates for monitored series. Errors are captured into `notes` (Phase 2 still runs).
 #[allow(clippy::too_many_arguments)]
 async fn phase1_metron(
-    db: &Db, client: &Client, user: &str, pass: &str,
+    db: &Db, client: &Client, auth: &MetronAuth,
     series: &[SeriesRec], issues: &mut HashMap<String, Vec<IssueRec>>, coverage: &HashMap<String, Vec<String>>,
     strays: &mut StrayMap,
     skeletons_created: &mut i32, candidates: &mut Vec<MonitorCandidate>, notes: &mut Vec<String>,
@@ -623,58 +624,25 @@ async fn phase1_metron(
     let mut metron_issues: Vec<Value> = Vec::new();
     let mut guard = 0;
 
-    'fetch: while let Some(url) = next_url.clone() {
+    // Pages go through the shared Metron client (metron_client.rs): paced from Metron's rate-limit
+    // headers, 429s honoured (a long one ends the run), only 429/5xx retried. Uncached — the window
+    // is today's view of upcoming releases.
+    while let Some(url) = next_url.clone() {
         if metron_issues.len() >= 3000 { break; }
         guard += 1;
         if guard > 1000 { notes.push("[Phase 1] Metron Oracle aborted: pagination guard tripped.".to_string()); break; }
 
-        let resp = match client.get(&url)
-            .basic_auth(user, Some(pass))
-            .header("User-Agent", "Omnibus/1.0")
-            .timeout(std::time::Duration::from_secs(15))
-            .send().await
-        {
-            Ok(r) => r,
-            Err(e) => { notes.push(format!("[Phase 1] Metron Oracle failed: {}", e)); break 'fetch; }
-        };
-        crate::api_usage::log(&db.pool, "metron", &url).await;
-
-        let status = resp.status();
-        if status.as_u16() == 429 {
-            let retry_after: u64 = resp.headers().get("retry-after").and_then(|v| v.to_str().ok()).and_then(|s| s.parse().ok()).unwrap_or(60);
-            tokio::time::sleep(std::time::Duration::from_millis((retry_after + 1) * 1000)).await;
-            continue;
-        }
-        if status.as_u16() >= 500 {
-            notes.push(format!("[Phase 1] Metron Oracle failed: HTTP {}", status.as_u16()));
-            break 'fetch;
-        }
-
-        // Burst-rate-limit headers (read before consuming the body).
-        let burst_remaining: i64 = resp.headers().get("x-ratelimit-burst-remaining").and_then(|v| v.to_str().ok()).and_then(|s| s.parse().ok()).unwrap_or(20);
-        let burst_reset: i64 = resp.headers().get("x-ratelimit-burst-reset").and_then(|v| v.to_str().ok()).and_then(|s| s.parse().ok()).unwrap_or(0);
-
-        let data: Value = match resp.json().await {
-            Ok(d) => d,
-            Err(e) => { notes.push(format!("[Phase 1] Metron Oracle failed: {}", e)); break 'fetch; }
+        let mut req = crate::metron_client::MetronRequest::new(&url);
+        req.use_cache = false;
+        let data = match crate::metron_client::metron_get(db, client, auth, req).await {
+            Ok((200, d)) => d,
+            Ok((status, _)) => { notes.push(format!("[Phase 1] Metron Oracle failed: HTTP {}", status)); break; }
+            Err(e) => { notes.push(format!("[Phase 1] Metron Oracle failed: {}", e)); break; }
         };
         if let Some(results) = data.get("results").and_then(|v| v.as_array()) {
             metron_issues.extend(results.iter().cloned());
         }
         next_url = data.get("next").and_then(|v| v.as_str()).map(|s| s.to_string());
-
-        // Pace to respect the burst budget (parity with the Node sleeps).
-        if burst_remaining <= 2 {
-            if burst_reset > 0 {
-                let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0);
-                let sleep_ms = ((burst_reset * 1000) - now_ms).max(0) + 500;
-                tokio::time::sleep(std::time::Duration::from_millis(sleep_ms as u64)).await;
-            } else {
-                tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
-            }
-        } else if next_url.is_some() {
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        }
     }
 
     notes.push(format!("[Phase 1] Metron Oracle fetched {} global upcoming releases.", metron_issues.len()));
@@ -801,7 +769,7 @@ async fn phase1_metron(
             relocated, deleted, evicted
         ));
     }
-    stray_audit(db, client, &(user.to_string(), pass.to_string()), series, issues, strays, &seen, &mut checked, notes).await;
+    stray_audit(db, client, auth, series, issues, strays, &seen, &mut checked, notes).await;
     save_audit_checked(db, &checked, strays).await;
 }
 
@@ -945,18 +913,9 @@ pub async fn run_series_monitor(db: Db) -> Result<MonitorOutput> {
     let mut candidates: Vec<MonitorCandidate> = Vec::new();
     let mut notes: Vec<String> = Vec::new();
 
-    // Phase 1 — Metron (only when credentials are present).
-    let creds = sqlx::query(r#"SELECT key, value FROM "SystemSetting" WHERE key IN ('metron_user','metron_pass')"#).fetch_all(&db.pool).await?;
-    let mut metron_user = String::new();
-    let mut metron_pass = String::new();
-    for r in &creds {
-        let k: String = r.get("key");
-        let v: String = r.get("value");
-        if k == "metron_user" { metron_user = v; } else if k == "metron_pass" { metron_pass = v; }
-    }
-    let metron_pass = crate::secret_crypto::decrypt_setting(&db.pool, Some(metron_pass)).await.unwrap_or_default();
-    if !metron_user.is_empty() && !metron_pass.is_empty() {
-        phase1_metron(&db, &client, &metron_user, &metron_pass, &series, &mut issues, &coverage, &mut strays, &mut skeletons_created, &mut candidates, &mut notes).await;
+    // Phase 1 — Metron (only when credentials are present: an API token, or username + password).
+    if let Some(auth) = crate::metron_client::load_auth(&db.pool).await {
+        phase1_metron(&db, &client, &auth, &series, &mut issues, &coverage, &mut strays, &mut skeletons_created, &mut candidates, &mut notes).await;
     }
 
     // Phase 2 — ComicVine (only when a key is present).

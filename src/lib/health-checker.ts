@@ -8,6 +8,7 @@ import { ENGINE_URL, engineHeaders } from '@/lib/engine';
 import { findDuplicateGroups } from '@/lib/duplicate-detector';
 import { SystemNotifier } from '@/lib/notifications';
 import packageJson from '../../package.json';
+import { describeMetronHealth, readRateStatus } from '@/lib/metron/client';
 
 export interface HealthCheckResult {
     id: string;
@@ -256,14 +257,11 @@ export async function runSystemHealthCheck() {
         } catch (e) {}
     }
 
+    // What Metron itself reported (X-RateLimit-Sustained-* - the daily limit varies by donor tier),
+    // shared by the Node app and the engine; our own count only when no window has been reported.
     const metronLimitTime = parseInt(config.metron_rate_limit_time || '0');
-    if (metronLimitTime > Date.now() - (60 * 60 * 1000)) {
-        results.push({ id: 'metron_limit', name: 'Metron.Cloud API', status: 'error', message: `Rate limit reached. Syncing paused. Past 24 hours: ${metronCalls} / 5000 calls.` });
-    } else if (metronCalls > 4000) {
-        results.push({ id: 'metron_limit', name: 'Metron.Cloud API', status: 'warning', message: `Approaching daily limit. Past 24 hours: ${metronCalls} / 5000 calls.` });
-    } else {
-        results.push({ id: 'metron_limit', name: 'Metron.Cloud API', status: 'ok', message: `Status: Normal. Past 24 hours: ${metronCalls} / 5000 calls.` });
-    }
+    const metronHealth = describeMetronHealth(await readRateStatus(), metronCalls, metronLimitTime, Date.now());
+    results.push({ id: 'metron_limit', name: 'Metron.Cloud API', status: metronHealth.status, message: metronHealth.message });
 
     const hosterLimitTime = parseInt(config.hoster_rate_limit_time || '0');
     if (hosterLimitTime > Date.now() - (24 * 60 * 60 * 1000)) {

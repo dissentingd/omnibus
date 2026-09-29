@@ -6,6 +6,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 use regex::Regex;
 use reqwest::Client;
+use crate::metron_client::MetronAuth;
 
 /// SQL predicate (embeddable in a WHERE, table referenced as "Series") matching a FILE-COMPLETE
 /// series — one whose local files already supplied everything a provider sync would add
@@ -1029,19 +1030,9 @@ async fn get_series_ended_cutoff(db: &Db) -> Option<(i64, i32)> {
     Some((chrono::Utc::now().timestamp_millis() - window_ms, months))
 }
 
-pub(crate) async fn metron_auth(db: &sqlx::AnyPool) -> Option<(String, String)> {
-    let rows = sqlx::query(r#"SELECT key, value FROM "SystemSetting" WHERE key IN ('metron_user','metron_pass')"#)
-        .fetch_all(db).await.unwrap_or_default();
-    let mut user = String::new();
-    let mut pass = String::new();
-    for row in rows {
-        let k: String = row.get("key");
-        let v: String = row.get("value");
-        if k == "metron_user" { user = v; } else if k == "metron_pass" { pass = v; }
-    }
-    // metron_pass is stored encrypted at rest (parity with Node); metron_user is not a secret.
-    let pass = crate::secret_crypto::decrypt_setting(db, Some(pass)).await.unwrap_or_default();
-    if user.is_empty() || pass.is_empty() || pass == "********" { None } else { Some((user, pass)) }
+/// The configured Metron credentials (API token preferred, else username + password).
+pub(crate) async fn metron_auth(db: &sqlx::AnyPool) -> Option<MetronAuth> {
+    crate::metron_client::load_auth(db).await
 }
 
 /// ISO timestamp ("2026-07-10T12:34:56", space-separated, or fractional/Z variants) -> RFC 7231
@@ -1054,113 +1045,18 @@ fn iso_to_http_date(iso: &str) -> Option<String> {
     Some(dt.format("%a, %d %b %Y %H:%M:%S GMT").to_string())
 }
 
-fn now_ms() -> i64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
-}
-
-fn metron_header_i64(resp: &reqwest::Response, name: &str, default: i64) -> i64 {
-    resp.headers().get(name).and_then(|v| v.to_str().ok()).and_then(|s| s.parse::<i64>().ok()).unwrap_or(default)
-}
-
-/// Metron HTTP GET with burst-rate-limit handling + retry/backoff (parity with metron.ts fetchWithBackoff).
+/// A background Metron GET through the shared client (metron_client.rs): token or Basic auth, pacing
+/// from Metron's rate-limit headers, retries only on 429/5xx, the shared response cache.
 /// `if_modified_since`: RFC 7231 date for conditional detail requests (metron.cloud best-practices) --
 /// the server answers 304 with no body when the resource is unchanged; callers must branch on status.
-pub(crate) async fn metron_fetch(db: &Db, client: &Client, auth: &(String, String), url: &str, timeout_secs: u64, max_retries: u32, if_modified_since: Option<&str>) -> anyhow::Result<(u16, serde_json::Value)> {
-    // Shared response cache (metadata_cache_enabled): conditional requests bypass it — their whole
-    // point is asking Metron "did this change". A hit skips the per-attempt api_usage logging below
-    // entirely (it isn't an upstream call).
-    if if_modified_since.is_none() {
-        if let Some(hit) = crate::metadata_cache::get(db, "metron", url).await {
-            return Ok((200, hit));
-        }
-    }
-    log::debug!("[Metron Debug] Executing Fetch: {}{}", url, if if_modified_since.is_some() { " (conditional)" } else { "" });
-    for attempt in 0..max_retries {
-        let mut req = client
-            .get(url)
-            .basic_auth(&auth.0, Some(&auth.1))
-            .header("User-Agent", "Omnibus/1.0")
-            .timeout(Duration::from_secs(timeout_secs));
-        if let Some(ims) = if_modified_since {
-            req = req.header("If-Modified-Since", ims);
-        }
-        match req
-            .send()
-            .await
-        {
-            Ok(resp) => {
-                let status = resp.status().as_u16();
-                // Every attempt is a real request against the 5,000/day sustained quota — record it
-                // so the health panel's Metron counter reflects engine traffic too (unified builds
-                // route all sync calls through here).
-                crate::api_usage::log(&db.pool, "metron", url).await;
-                let remaining = metron_header_i64(&resp, "x-ratelimit-burst-remaining", 20);
-                log::debug!("[Metron Debug] Rate Limit Status -> Burst Remaining: {}", remaining);
-
-                if remaining <= 2 {
-                    let reset = metron_header_i64(&resp, "x-ratelimit-burst-reset", 0);
-                    if reset > 0 {
-                        let sleep_ms = ((reset * 1000) - now_ms()).max(0) + 500;
-                        if sleep_ms > 0 { tokio::time::sleep(Duration::from_millis(sleep_ms as u64)).await; }
-                    }
-                }
-
-                if status == 429 {
-                    let retry_after = metron_header_i64(&resp, "retry-after", 60);
-                    if retry_after > 60 {
-                        // Flag the throttle so the UI shows a "Metron rate-limited" banner. Parity with
-                        // metadata-fetcher.ts, which flags only when a 429 propagates (a FATAL block) —
-                        // not a transient 429 that the backoff loop below recovers from.
-                        mark_flag(db, "metron_rate_limit_time").await;
-                        log::error!("[Metron] FATAL Rate Limit Hit. IP blocked for {}s.", retry_after);
-                        anyhow::bail!("FATAL_RATE_LIMIT");
-                    }
-                    log::warn!("[Metron] Rate Limit Hit. Waiting {}s before retrying...", retry_after);
-                    tokio::time::sleep(Duration::from_secs((retry_after + 1).max(0) as u64)).await;
-                    continue;
-                }
-
-                let valid = (200..300).contains(&status) || status == 304 || status == 404;
-                if !valid {
-                    // Hard 4xx (bad credentials/params) won't improve on retry — metron.cloud's API
-                    // best-practices: only 429 and 5xx are retryable. Bail instead of burning quota.
-                    if (400..500).contains(&status) {
-                        anyhow::bail!("Metron HTTP Error: {} (not retried)", status);
-                    }
-                    if attempt + 1 == max_retries { anyhow::bail!("Metron HTTP Error: {}", status); }
-                    tokio::time::sleep(Duration::from_secs(2)).await;
-                    continue;
-                }
-
-                if status == 204 || status == 304 {
-                    return Ok((status, serde_json::Value::Null));
-                }
-                // A 2xx/404 body that doesn't parse is a real failure -- silently returning Null here
-                // let a truncated response overwrite good series data with "Unknown" fields. Retry it
-                // like a network error; bail after max retries.
-                match resp.json::<serde_json::Value>().await {
-                    Ok(data) => {
-                        if status == 200 && if_modified_since.is_none() {
-                            crate::metadata_cache::put(db, "metron", url, &data).await;
-                        }
-                        return Ok((status, data));
-                    }
-                    Err(e) => {
-                        log::warn!("[Metron] Response body for {} did not parse as JSON (attempt {}/{}): {}", url, attempt + 1, max_retries, e);
-                        if attempt + 1 == max_retries { anyhow::bail!("Metron returned an unparseable body for {}", url); }
-                        tokio::time::sleep(Duration::from_secs(2)).await;
-                        continue;
-                    }
-                }
-            }
-            Err(e) => {
-                log::debug!("[Metron Debug] Fetch Attempt {} Failed: {}", attempt + 1, e);
-                if attempt + 1 == max_retries { return Err(e.into()); }
-                tokio::time::sleep(Duration::from_secs(2)).await;
-            }
-        }
-    }
-    anyhow::bail!("Metron max retries reached")
+pub(crate) async fn metron_fetch(db: &Db, client: &Client, auth: &MetronAuth, url: &str, timeout_secs: u64, max_retries: u32, if_modified_since: Option<&str>) -> anyhow::Result<(u16, serde_json::Value)> {
+    crate::metron_client::metron_get(db, client, auth, crate::metron_client::MetronRequest {
+        url,
+        timeout_secs,
+        max_attempts: max_retries,
+        if_modified_since,
+        use_cache: true,
+    }).await
 }
 
 /// Builds the issue display name (parity with metron.ts getSeriesIssues name logic).
@@ -1599,7 +1495,7 @@ async fn fetch_metron(
 async fn metron_detail_credits_nonfatal(
     db: &Db,
     client: &Client,
-    auth: &(String, String),
+    auth: &MetronAuth,
     series_id: &str,
     series_name: &str,
     file_priority: bool,
@@ -1628,8 +1524,8 @@ async fn metron_detail_credits_nonfatal(
 /// Per-issue Metron detail enrichment — credits AND the story title (#199 round 3), since the
 /// issue_list endpoint carries neither; each issue costs one /issue/{id}/ detail call. Runs for
 /// every targeted (match-time) sync, and for the scheduled sweep only when the
-/// metron_detail_credits opt-in is set. Budget-gated against the
-/// 5,000/day Metron window with a reserve so normal syncing never starves — issues left over stay
+/// metron_detail_credits opt-in is set. Budget-gated against the account's daily Metron window (the
+/// limit Metron reports, which varies by donor tier) with a reserve so normal syncing never starves — issues left over stay
 /// non-DEEP_SYNCED and are picked up on the next sync (same deferral model as the unmatched sweep,
 /// discussion #177). Fetched credits merge through the never-wipe policy (issue #179) and the issue
 /// is promoted to DEEP_SYNCED, which also stops the view-time lazy fetch from re-paying for it.
@@ -1637,14 +1533,11 @@ async fn metron_detail_credits_nonfatal(
 async fn metron_detail_credit_pass(
     db: &Db,
     client: &Client,
-    auth: &(String, String),
+    auth: &MetronAuth,
     series_id: &str,
     series_name: &str,
     file_priority: bool,
 ) -> anyhow::Result<(usize, usize)> {
-    const METRON_DAILY_LIMIT: usize = 5000;
-    const METRON_RESERVE: usize = 500;
-
     // Locked (hasCustomMetadata) issues are excluded outright: the merge policy would keep every
     // existing column anyway, so the detail call would be a pure quota burn.
     let rows = sqlx::query(
@@ -1663,10 +1556,9 @@ async fn metron_detail_credit_pass(
 
     let mut enriched = 0usize;
     for (i, row) in rows.iter().enumerate() {
-        let calls = crate::api_usage::metron_calls_last_day(&db.pool).await;
-        if crate::matcher::budget_exhausted(calls, METRON_DAILY_LIMIT, METRON_RESERVE) {
+        if crate::metron_client::optional_budget_exhausted(db).await {
             let deferred = rows.len() - i;
-            log::info!("[Metadata] Metron daily budget reached ({} calls) — deferring credit enrichment for {} issue(s) of {} to the next sync.", calls, deferred, series_name);
+            log::info!("[Metadata] Metron daily budget nearly used — deferring credit enrichment for {} issue(s) of {} to the next sync.", deferred, series_name);
             return Ok((enriched, deferred));
         }
 
@@ -1774,7 +1666,7 @@ async fn resolve_cover(client: &Client, image_url: Option<&str>, folder_path: &s
 
     if let Some(url) = image_url {
         if !folder_path.trim().is_empty() && Path::new(folder_path).exists() {
-            match client.get(url).timeout(Duration::from_secs(15)).send().await {
+            match client.get(url).header("User-Agent", crate::metron_client::user_agent()).timeout(Duration::from_secs(15)).send().await {
                 Ok(resp) => {
                     let content_type = resp.headers().get(reqwest::header::CONTENT_TYPE)
                         .and_then(|v| v.to_str().ok()).unwrap_or("").to_lowercase();
