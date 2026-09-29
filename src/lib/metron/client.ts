@@ -19,6 +19,7 @@ import { Logger } from '@/lib/logger';
 import { getCachedResponse, putCachedResponse } from '@/lib/metadata/metadata-cache';
 import { logApiUsage, markSystemFlag } from '@/lib/utils/system-flags';
 import packageJson from '../../../package.json';
+import { BASE_DAILY_LIMIT, isNum, type RateStatus, type RateWindow } from './health';
 
 export const METRON_PROJECT_URL = 'https://github.com/hankscafe/omnibus';
 export const METRON_USER_AGENT = `Omnibus/${packageJson.version} (+${METRON_PROJECT_URL})`;
@@ -27,7 +28,6 @@ export const METRON_RATE_STATUS_KEY = 'metron_rate_status';
 const BURST_PERIOD_MS = 60_000;
 const DEFAULT_BURST_LIMIT = 20; // Metron's documented floor, until a response reports the real limit
 const MAX_INLINE_WAIT_S = 60; // a longer 429 (or block) stops the work instead of waiting it out
-const BASE_DAILY_LIMIT = 5_000; // fallback only - the real limit varies by donor tier
 
 // ------------------------------------------------------------------ auth
 
@@ -74,12 +74,9 @@ export function authHeader(auth: MetronAuth): string {
 
 // ------------------------------------------------------------------ rate-limit state
 
-/** One rate-limit window as Metron reports it; `reset` is a Unix epoch in seconds. */
-export type RateWindow = { limit?: number | null; remaining?: number | null; reset?: number | null };
-/** The state both processes share (SystemSetting `metron_rate_status`). */
-export type RateStatus = { burst: RateWindow; sustained: RateWindow; blockedUntil?: number | null; updatedAt?: number | null };
-
-const isNum = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v);
+// The state types, the tier and the Health line live in ./health (client-safe, for the Health modal).
+export type { RateWindow, RateStatus } from './health';
+export { describeMetronHealth } from './health';
 
 /** Reads `X-RateLimit-{Burst,Sustained}-{Limit,Remaining,Reset}`. */
 export function parseRateHeaders(headers: Headers): { burst: RateWindow; sustained: RateWindow } {
@@ -407,41 +404,6 @@ export async function metronGet<T = any>(url: string, opts: MetronGetOptions = {
         return { status: response.status, data, cached: false };
     }
     throw lastErr;
-}
-
-function formatDuration(ms: number): string {
-    const totalMin = Math.max(1, Math.ceil(ms / 60_000));
-    const h = Math.floor(totalMin / 60);
-    const m = totalMin % 60;
-    return h > 0 ? `${h}h ${m}m` : `${m}m`;
-}
-
-/**
- * The Health panel's Metron line, from what Metron itself reported (the daily limit varies by donor
- * tier), falling back to our own 24h count against the base limit when no window has been reported.
- */
-export function describeMetronHealth(
-    status: RateStatus, localCalls24h: number, rateLimitFlagMs: number, nowMs: number,
-): { status: 'ok' | 'warning' | 'error'; message: string } {
-    if (isNum(status.blockedUntil) && status.blockedUntil > nowMs) {
-        return { status: 'error', message: `Metron has asked Omnibus to pause (rate limit). Requests resume in ${formatDuration(status.blockedUntil - nowMs)}.` };
-    }
-    const s = status.sustained;
-    const current = isNum(s.reset) && s.reset * 1000 > nowMs && isNum(s.limit) && isNum(s.remaining);
-    if (current) {
-        const left = `${s.remaining!.toLocaleString('en-US')} of ${s.limit!.toLocaleString('en-US')} requests left today (resets in ${formatDuration(s.reset! * 1000 - nowMs)})`;
-        if (s.remaining! <= 0) return { status: 'error', message: `Daily limit reached. Syncing paused: ${left}.` };
-        if (rateLimitFlagMs > nowMs - 60 * 60 * 1000) return { status: 'error', message: `Rate limit reached within the last hour. Syncing paused. ${left}.` };
-        if (s.remaining! < s.limit! * 0.2) return { status: 'warning', message: `Approaching the daily limit: ${left}.` };
-        return { status: 'ok', message: `Status: Normal. ${left}.` };
-    }
-    if (rateLimitFlagMs > nowMs - 60 * 60 * 1000) {
-        return { status: 'error', message: `Rate limit reached. Syncing paused. Past 24 hours: ${localCalls24h} calls.` };
-    }
-    if (localCalls24h > BASE_DAILY_LIMIT * 0.8) {
-        return { status: 'warning', message: `Approaching the daily limit. Past 24 hours: ${localCalls24h} / ${BASE_DAILY_LIMIT} calls.` };
-    }
-    return { status: 'ok', message: `Status: Normal. Past 24 hours: ${localCalls24h} / ${BASE_DAILY_LIMIT} calls.` };
 }
 
 /** Whether optional bulk work should stop (see optionalBudgetSpent), from the shared state + our counter. */

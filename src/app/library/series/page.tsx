@@ -35,6 +35,7 @@ import { FolderCollisionDialog, type FolderCollision, type CollisionResolution }
 import { CoverageField } from "@/components/coverage-field"
 import { CoveredIssuesSection } from "@/components/covered-issues-section"
 import { requestNameFor } from "@/lib/utils/request-name"
+import { hasMetronCredentials } from "@/lib/metron/credentials"
 
 // Loop-safe fallback for cover <img>s: on a broken cover, swap to the series cover; if that also fails,
 // hide the element rather than show the browser's broken-image glyph. (The issue grid had no onError, so
@@ -268,11 +269,7 @@ function SeriesContent() {
         fetch('/api/admin/config')
             .then(res => res.ok ? res.json() : null)
             .then(data => {
-                if (data?.settings) {
-                    const mUser = data.settings.find((s: any) => s.key === 'metron_user')?.value;
-                    const mPass = data.settings.find((s: any) => s.key === 'metron_pass')?.value;
-                    if (mUser && mPass) setMetronConfigured(true);
-                }
+                if (data?.settings && hasMetronCredentials(data.settings)) setMetronConfigured(true);
             })
             .catch(() => {});
     }

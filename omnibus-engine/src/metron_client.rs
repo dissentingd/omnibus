@@ -35,12 +35,23 @@ const DEFAULT_BURST_LIMIT: i64 = 20;
 const MAX_INLINE_RETRY_AFTER_S: i64 = 60;
 
 /// How to authenticate against Metron.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub(crate) enum MetronAuth {
     /// An API token from metron.cloud → Profile → API Tokens (`Authorization: Bearer <token>`).
     Token(String),
     /// Username + password (HTTP Basic) — being retired by Metron.
     Basic(String, String),
+}
+
+/// Says which kind of credential it is, never the secret itself: a `{:?}` of it in a log line, an error
+/// or a failed assertion must not put the token or the password in the logs.
+impl std::fmt::Debug for MetronAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MetronAuth::Token(_) => f.write_str("Token(********)"),
+            MetronAuth::Basic(user, _) => write!(f, "Basic({:?}, ********)", user),
+        }
+    }
 }
 
 impl MetronAuth {
@@ -471,6 +482,16 @@ mod tests {
         assert_eq!(bearer.headers()["authorization"], "Bearer tok123");
         let basic = MetronAuth::Basic("adam".into(), "pw".into()).apply(client.get("https://metron.cloud/api/issue/")).build().unwrap();
         assert_eq!(basic.headers()["authorization"], "Basic YWRhbTpwdw==");
+    }
+
+    // Metron beta 3: nothing logs the credentials today, but a `{:?}` of them - in a log line, an error,
+    // a failed assertion - must never print the token or the password either.
+    #[test]
+    fn debug_output_never_contains_the_token_or_the_password() {
+        let token = format!("{:?}", MetronAuth::Token("tok_SECRET".into()));
+        let basic = format!("{:?}", MetronAuth::Basic("adam".into(), "pw_SECRET".into()));
+        assert!(!token.contains("SECRET") && !basic.contains("SECRET"), "{} / {}", token, basic);
+        assert!(token.starts_with("Token") && basic.contains("adam"), "still says which kind (and the username isn't a secret): {} / {}", token, basic);
     }
 
     #[test]

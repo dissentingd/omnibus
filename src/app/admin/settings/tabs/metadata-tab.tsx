@@ -90,6 +90,14 @@ export function MetadataTab({ s }: { s: SettingsBag }) {
                     <div className="space-y-4 pt-4">
                         <h3 className="text-lg font-bold text-foreground flex items-center gap-2 border-b border-border pb-2"><Database className="w-4 h-4 text-primary" /> Metron.Cloud Integration (Optional)</h3>
                         <p className="text-[0.8rem] text-muted-foreground">Metron is an open-source alternative to ComicVine.  Metron integration is required to populate the Release Calendar.</p>
+                        <div className="grid gap-2">
+                            <Label htmlFor="metron_api_token" className="text-foreground font-semibold">Metron API Token</Label>
+                            <Input id="metron_api_token" type="password" value={config.metron_api_token || ""} onChange={(e) => setConfig({...config, metron_api_token: e.target.value})} className="h-12 sm:h-10 bg-muted/50 border-border text-foreground" />
+                        </div>
+                        <p className="text-[0.8rem] text-muted-foreground">Create a token on <a href="https://metron.cloud/" target="_blank" rel="noreferrer" className="underline text-primary hover:text-primary/80 transition-colors">metron.cloud</a> under Profile → API Tokens (it's shown once, so paste it here straight away). Metron is retiring username and password sign-in for its API, so a token is the way to connect.</p>
+                        {(config.metron_api_token || "").trim() !== "" && (
+                            <p className="text-[0.8rem] text-muted-foreground">An API token is in use, so the username and password below aren't used.</p>
+                        )}
                         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                             <div className="grid gap-2">
                                 <Label className="text-foreground font-semibold">Metron Username</Label>

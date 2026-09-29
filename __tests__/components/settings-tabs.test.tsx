@@ -91,6 +91,24 @@ describe('Settings tabs (Phase 1 reorganization)', () => {
         expect(bag.setConfig).toHaveBeenCalledWith(expect.objectContaining({ file_metadata_priority: 'true' }));
     });
 
+    // Metron beta 3: Metron is retiring username/password sign-in for its API in favour of tokens.
+    it('MetadataTab takes a Metron API token and says where to get one', () => {
+        const bag = mkBag();
+        render(<MetadataTab s={bag} />);
+
+        const token = screen.getByLabelText(/Metron API Token/i);
+        expect(token).toHaveAttribute('type', 'password');
+        expect(screen.getByRole('link', { name: /metron\.cloud/i })).toHaveAttribute('href', expect.stringContaining('metron.cloud'));
+
+        fireEvent.change(token, { target: { value: 'tok_abc123' } });
+        expect(bag.setConfig).toHaveBeenCalledWith(expect.objectContaining({ metron_api_token: 'tok_abc123' }));
+    });
+
+    it('MetadataTab says the username and password are unused once a token is set', () => {
+        render(<MetadataTab s={mkBag({ config: { metron_api_token: '********', metron_user: 'adam', metron_pass: '********' } })} />);
+        expect(screen.getByText(/API token is in use/i)).toBeInTheDocument();
+    });
+
     it('MetadataTab no longer hosts the manga detection lists (moved to Discovery)', () => {
         render(<MetadataTab s={mkBag()} />);
         expect(screen.queryByText(/Auto-Tagging Logic/i)).not.toBeInTheDocument();
