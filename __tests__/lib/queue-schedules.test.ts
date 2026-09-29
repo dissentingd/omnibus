@@ -78,7 +78,7 @@ describe('syncSchedules: per-install staggered schedules (#216)', () => {
             const call = schedulerCall(`repeat_${jobType.toLowerCase()}`);
             expect(call, jobType).toBeDefined();
             expect(call![1]).toEqual({ every, offset: scheduleOffsetMs(SEED, jobType, every) });
-            expect(call![2]).toEqual({ name: jobType, data: { type: jobType } });
+            expect(call![2]).toMatchObject({ name: jobType, data: { type: jobType } });
         }
         // Nothing goes through the old epoch-aligned repeat path any more.
         expect(mocks.queueAdd.mock.calls.filter(call => call[2]?.repeat)).toEqual([]);
@@ -93,6 +93,21 @@ describe('syncSchedules: per-install staggered schedules (#216)', () => {
             const call = schedulerCall(`repeat_${jobType.toLowerCase()}`);
             expect(call, jobType).toBeDefined();
             expect(call![1]).toEqual({ every, offset: scheduleOffsetMs(SEED, jobType, every) });
+        }
+    });
+
+    // #216 follow-up: a failed scheduled run that calls Metron, ComicVine or GitHub was retried twice
+    // more within seconds (the queue default, 3 attempts) - the next scheduled run is its retry.
+    it('never retries a scheduled run that calls an outside service; local jobs keep the default retries', async () => {
+        withSettings({ metadata_sync_schedule: '24', monitor_sync_schedule: '24', popular_sync_schedule: '24', library_sync_schedule: '12', backup_sync_schedule: '24' });
+
+        await syncSchedules();
+
+        for (const jobType of ['METADATA_SYNC', 'SERIES_MONITOR', 'DISCOVER_SYNC', 'FOR_YOU_SYNC', 'UNMATCHED_SWEEP', 'UPDATE_CHECK']) {
+            expect(schedulerCall(`repeat_${jobType.toLowerCase()}`)![2], jobType).toEqual({ name: jobType, data: { type: jobType }, opts: { attempts: 1 } });
+        }
+        for (const jobType of ['LIBRARY_SCAN', 'DATABASE_BACKUP', 'WATCHED_FOLDER_SYNC', 'SYSTEM_HEALTH_CHECK']) {
+            expect(schedulerCall(`repeat_${jobType.toLowerCase()}`)![2], jobType).toEqual({ name: jobType, data: { type: jobType } });
         }
     });
 

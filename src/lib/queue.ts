@@ -89,6 +89,13 @@ export const omnibusQueue = globalForMQ.omnibusQueue || new Queue('omnibus-backg
 
 if (process.env.NODE_ENV !== 'production') globalForMQ.omnibusQueue = omnibusQueue;
 
+// Scheduled jobs that call an outside service (Metron, ComicVine, GitHub). A failed run is not retried
+// by the queue - the next scheduled run is its retry - so a provider having a bad minute doesn't get
+// the same run twice more within seconds (#216). A manual "Run Now" keeps the queue's default retries.
+const NO_RETRY_SCHEDULED_JOBS = new Set([
+    'METADATA_SYNC', 'SERIES_MONITOR', 'DISCOVER_SYNC', 'FOR_YOU_SYNC', 'UNMATCHED_SWEEP', 'UPDATE_CHECK'
+]);
+
 export async function syncSchedules() {
     const settings = await prisma.systemSetting.findMany({
         where: {
@@ -128,7 +135,9 @@ export async function syncSchedules() {
     const scheduled = new Set<string>();
     const addJob = async (jobType: string, hoursStr: string | undefined, cronPattern?: string) => {
         const schedulerId = `repeat_${jobType.toLowerCase()}`;
-        const template = { name: jobType, data: { type: jobType } };
+        const template = NO_RETRY_SCHEDULED_JOBS.has(jobType)
+            ? { name: jobType, data: { type: jobType }, opts: { attempts: 1 } }
+            : { name: jobType, data: { type: jobType } };
 
         // --- ADDED: If a cron string is passed, use that instead of intervals ---
         if (cronPattern) {
@@ -873,7 +882,7 @@ export function initWorker() {
 
                     const admin = await prisma.user.findFirst({ where: { role: 'ADMIN' } });
 
-                    // The heavy half (Metron 3000 + ComicVine 25x30 fetch/match/skeleton-upsert) is owned by
+                    // The heavy half (Metron upcoming window + ComicVine 25x30 fetch/match/skeleton-upsert) is owned by
                     // the Rust engine (/api/monitor/sync -> monitor::run_series_monitor). It returns the
                     // skeleton count + the monitored, matched, not-in-library issues as candidates; request
                     // creation + searchAndDownload (BullMQ) stay here. The call is synchronous and can take
