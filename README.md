@@ -317,8 +317,8 @@ Omnibus acts as a master "save state" for your physical e-ink devices (Kobo, Kin
 3. Navigate to **Settings → Progress Sync → Custom sync server**.
 4. Enter your Omnibus URL: `http://<your-omnibus-ip>:3000/api/koreader`
 5. Tap **Login** and use your Omnibus **Username** and the new **Omnibus API Key** as the password.
-6. Enable **Progress Sync → Send document metadata**. This is off by default. With it enabled, Omnibus uses the real filename to bind progress to the matching library issue; without it, KOReader device-to-device sync still works but Omnibus cannot bind the progress to an issue. KOReader builds that do not have this option provide device-to-device sync only.
-7. Leave **Document matching method** on its normal **Binary** or **Filename** setting. The old **Path** setting is not required and the document field sent by KOReader is a checksum, not a path.
+6. Leave **Document matching method** on **Binary** (KOReader's default). Omnibus records each book's KOReader checksum when you download it - through the OPDS catalog or the web download button - so your progress lands on the right issue with no other KOReader settings, and resumes on the same page in the web reader.
+7. For books that reached your device some other way (copied from the library folder, say), enable **Progress Sync → Send document metadata** (off by default) so Omnibus can match them by filename; in KOReader's OPDS catalog settings, **Use server filenames** keeps the library's file names. With the **Filename** matching method, downloaded books also need **Use server filenames**. Without a match, KOReader device-to-device sync still works but the progress doesn't appear in Omnibus.
 
 ### Reading Lists
 Perfect for navigating the complex web of massive comic book crossover events or creating your own curated reading orders.
