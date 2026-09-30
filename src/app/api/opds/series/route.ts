@@ -6,6 +6,7 @@ import { Logger } from '@/lib/logger';
 import { escapeXml } from '@/lib/utils/xml';
 import { getAccessibleLibraryIds, seriesAccessWhere } from '@/lib/library-access';
 import { getPublicBaseUrl } from '@/lib/opds-base-url';
+import { opdsCoverLinks } from '@/lib/opds-covers';
 
 export const dynamic = 'force-dynamic';
 
@@ -40,9 +41,9 @@ export async function GET(req: Request) {
     const items = hasNext ? seriesList.slice(0, limit) : seriesList;
 
     const entries = items.map(s => {
-        const rawCover = s.coverUrl || (s.folderPath ? `/api/library/cover?path=${encodeURIComponent(s.folderPath)}` : '');
-        // FIX: Check if it's already an external HTTP link
-        const finalCoverUrl = rawCover.startsWith('http') ? rawCover : (rawCover ? `${baseUrl}${rawCover}` : '');
+        // Covers go through the OPDS-key cover route (lib/opds-covers.ts): the library cover route
+        // needs a web session, which an OPDS client never has.
+        const coverLinks = s.coverUrl || s.folderPath ? opdsCoverLinks(baseUrl, 'series', s.id) : '';
 
         return `
   <entry>
@@ -51,8 +52,7 @@ export async function GET(req: Request) {
     <updated>${new Date().toISOString()}</updated>
     <author><name>${escapeXml(s.publisher || 'Unknown')}</name></author>
     <content type="text">${escapeXml(s.description || 'No description available.')}</content>
-    ${finalCoverUrl ? `<link rel="http://opds-spec.org/image" href="${escapeXml(finalCoverUrl)}" type="image/jpeg"/>` : ''}
-    ${finalCoverUrl ? `<link rel="http://opds-spec.org/image/thumbnail" href="${escapeXml(finalCoverUrl)}" type="image/jpeg"/>` : ''}
+    ${coverLinks}
     <link rel="subsection" href="${baseUrl}/api/opds/series/${s.id}" type="application/atom+xml;profile=opds-catalog;kind=navigation"/>
   </entry>`;
     }).join('');

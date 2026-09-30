@@ -7,6 +7,7 @@ import { escapeXml } from '@/lib/utils/xml';
 import { getAccessibleLibraryIds, canAccessLibraryId } from '@/lib/library-access';
 import { countArchivePages, isPageCountable, countArchivePagesViaEngine, isEngineCountable } from '@/lib/utils/archive-pages';
 import { getPublicBaseUrl } from '@/lib/opds-base-url';
+import { opdsCoverLinks } from '@/lib/opds-covers';
 
 export const dynamic = 'force-dynamic';
 
@@ -55,9 +56,6 @@ export async function GET(req: Request, { params }: { params: Promise<{ id: stri
 
     const entries = [];
     for (const issue of sortedIssues) {
-        const rawCover = issue.coverUrl || (series.folderPath ? `/api/library/cover?path=${encodeURIComponent(series.folderPath)}` : '');
-        const finalCoverUrl = rawCover.startsWith('http') ? rawCover : (rawCover ? `${baseUrl}${rawCover}` : '');
-
         // --- MEMORY LEAK FIXED: Pulling directly from DB instead of loading files into RAM ---
         let pageCount = (issue as any).pageCount || 0;
         // Self-heal issues indexed before page counts were persisted: without a real pse:count,
@@ -89,8 +87,7 @@ export async function GET(req: Request, { params }: { params: Promise<{ id: stri
     <updated>${new Date().toISOString()}</updated>
     <author><name>${escapeXml(series.publisher || 'Unknown')}</name></author>
     <content type="text">${escapeXml(issue.description || 'No synopsis available.')}</content>
-    ${finalCoverUrl ? `<link rel="http://opds-spec.org/image" href="${escapeXml(finalCoverUrl)}" type="image/jpeg"/>` : ''}
-    ${finalCoverUrl ? `<link rel="http://opds-spec.org/image/thumbnail" href="${escapeXml(finalCoverUrl)}" type="image/jpeg"/>` : ''}
+    ${opdsCoverLinks(baseUrl, 'issue', issue.id)}
     ${pseLink}
     ${downloadLink}
   </entry>`);

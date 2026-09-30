@@ -5,7 +5,8 @@
 // itself is served by the existing cover route (local cover files, remote provider art, first-page
 // renders, disk-cached WebP thumbnails) — but that route sits under /api/library, which the
 // middleware 401s for a client with no session cookie, so a redirect is not an option. The facade
-// calls the cover handler in-process instead.
+// calls the cover handler in-process instead. The OPDS cover routes (/api/opds/cover/…) do the same
+// for OPDS clients, at their own widths.
 import { NextRequest } from 'next/server';
 import { GET as serveCover } from '@/app/api/library/cover/route';
 
@@ -29,9 +30,9 @@ export function coverQueryFor(coverUrl: string | null | undefined): CoverQuery |
     return null;
 }
 
-export function delegateCover(req: Request, query: CoverQuery): Promise<Response> {
+export function delegateCover(req: Request, query: CoverQuery, width: string = THUMB_WIDTH): Promise<Response> {
     const url = new URL('/api/library/cover', req.url);
     for (const [k, v] of Object.entries(query)) url.searchParams.set(k, v);
-    url.searchParams.set('w', THUMB_WIDTH);
+    url.searchParams.set('w', width);
     return serveCover(new NextRequest(url, { headers: req.headers }));
 }
