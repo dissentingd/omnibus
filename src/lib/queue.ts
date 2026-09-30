@@ -766,7 +766,9 @@ export function initWorker() {
                             method: 'POST',
                             headers: engineHeaders({ 'Content-Type': 'application/json' }),
                             body: JSON.stringify({
-                                series_ids: isTargeted ? job.data.seriesIds : null
+                                series_ids: isTargeted ? job.data.seriesIds : null,
+                                // A yes to a series' Refresh Metadata per-issue credits ask (Metron beta 4).
+                                ...(isTargeted && job.data.fetchCredits === true ? { fetch_credits: true } : {})
                             })
                         });
 

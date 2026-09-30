@@ -104,6 +104,14 @@ describe('Settings tabs (Phase 1 reorganization)', () => {
         expect(bag.setConfig).toHaveBeenCalledWith(expect.objectContaining({ metron_api_token: 'tok_abc123' }));
     });
 
+    // Metron beta 4: the per-issue credits help says what the switch really governs now.
+    it('MetadataTab explains when per-issue Metron credits are fetched with the setting off', () => {
+        render(<MetadataTab s={mkBag()} />);
+        const help = screen.getByText(/one extra Metron request per issue you have on disk/);
+        expect(help).toHaveTextContent(/Refresh Metadata \(which asks first, with the count\)/);
+        expect(help).toHaveTextContent(/opening an issue/);
+    });
+
     it('MetadataTab says the username and password are unused once a token is set', () => {
         render(<MetadataTab s={mkBag({ config: { metron_api_token: '********', metron_user: 'adam', metron_pass: '********' } })} />);
         expect(screen.getByText(/API token is in use/i)).toBeInTheDocument();

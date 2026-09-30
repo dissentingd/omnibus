@@ -75,6 +75,9 @@ struct ScanRequest {
 #[derive(Deserialize)]
 struct MetadataRequest {
     series_ids: Option<Vec<String>>,
+    /// A person asked for per-issue Metron credits on this refresh (the Refresh button's ask).
+    #[serde(default)]
+    fetch_credits: bool,
 }
 
 #[derive(Deserialize)]
@@ -1274,7 +1277,7 @@ async fn handle_metadata_sync(
     tokio::spawn(async move {
         let db = state.db.clone();
         let start_time = std::time::Instant::now();
-        match metadata::sync_metadata(state.db.clone(), payload.series_ids).await {
+        match metadata::sync_metadata(state.db.clone(), payload.series_ids, payload.fetch_credits).await {
             Ok(_) => notify_node("job_metadata_sync", "Metadata synchronization completed.").await,
             Err(e) => {
                 log::error!("❌ Background Metadata Synchronization failed: {:?}", e);

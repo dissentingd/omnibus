@@ -1,7 +1,12 @@
 // src/lib/metadata/providers/metron.ts
-import { IMetadataProvider, MetadataSeries, MetadataIssue } from '../provider';
+import { IMetadataProvider, MetadataSeries, MetadataIssue, SearchSeriesOptions } from '../provider';
 import { Logger } from '@/lib/logger';
 import { getMetronAuth, metronGet, MetronHttpError, MetronPace, MetronResponse } from '@/lib/metron/client';
+
+/** Results per Metron list page (their API's page size). */
+const METRON_PAGE_SIZE = 100;
+/** Results per Omnibus search page. */
+const UI_PAGE_SIZE = 10;
 
 const extractName = (obj: any): string => {
     if (!obj) return '';
@@ -46,22 +51,43 @@ export class MetronProvider implements IMetadataProvider {
         return metronGet(url, { pace: this.pace, ...extra });
     }
 
-    /** A first-issue cover for a series: a nice-to-have, skipped (null) rather than waited for. */
-    private async firstIssueCover(seriesId: string | number): Promise<string | null> {
+    /**
+     * A series' first-issue cover (Metron's series payloads carry no image, so it costs an issue_list
+     * request): the URL, null when the series has none, or undefined when the request was skipped -
+     * a nice-to-have is never waited for - or failed.
+     */
+    private async tryFirstIssueCover(seriesId: string | number): Promise<string | null | undefined> {
         try {
             const res = await metronGet(`${this.baseUrl}/series/${seriesId}/issue_list/`, { pace: this.pace, optional: true, maxAttempts: 1, timeoutMs: 5000 });
             return res.data?.results?.[0]?.image || null;
         } catch {
-            return null;
+            return undefined;
         }
     }
 
-    async searchSeries(query: string, page: number = 1): Promise<MetadataSeries[]> {
+    private async firstIssueCover(seriesId: string | number): Promise<string | null> {
+        return (await this.tryFirstIssueCover(seriesId)) ?? null;
+    }
+
+    /** One series' cover, for a result someone is about to look at (see /api/search/cover). */
+    async seriesCover(seriesId: string): Promise<string | null> {
+        if (!(await getMetronAuth())) return null;
+        return this.firstIssueCover(seriesId);
+    }
+
+    /**
+     * Series search, ten results per page. `covers` fetches a first-issue cover per result - one
+     * Metron request each - so only a search someone is looking at asks for them (Metron beta 4).
+     */
+    async searchSeries(query: string, page: number = 1, opts: SearchSeriesOptions = {}): Promise<MetadataSeries[]> {
         if (!(await getMetronAuth())) return [];
 
-        const metronPage = Math.floor((page - 1) / 5) + 1;
-        const startIndex = ((page - 1) % 5) * 10;
-        const endIndex = startIndex + 10;
+        // Metron pages hold 100 results (checked 2026-09-30; this assumed 50, so results 51-100 of
+        // every page were unreachable): ten of our pages per Metron page.
+        const perMetronPage = METRON_PAGE_SIZE / UI_PAGE_SIZE;
+        const metronPage = Math.floor((page - 1) / perMetronPage) + 1;
+        const startIndex = ((page - 1) % perMetronPage) * UI_PAGE_SIZE;
+        const endIndex = startIndex + UI_PAGE_SIZE;
 
         const res = await this.get(`${this.baseUrl}/series/?name=${encodeURIComponent(query)}&page=${metronPage}`, { timeoutMs: 10000 });
 
@@ -79,9 +105,9 @@ export class MetronProvider implements IMetadataProvider {
                 realPublisher = typeof series.publisher === 'string' ? series.publisher : (series.publisher.name || "Unknown");
             }
 
-            // Covers are optional: skipped (null) the moment Metron's burst window has no free slot,
-            // so a search page never waits on them.
-            const coverUrl = await this.firstIssueCover(series.id);
+            // Covers are optional: skipped the moment Metron's burst window has no free slot, so a
+            // search page never waits on them (the page is then left uncached - see /api/search).
+            const cover = opts.covers ? await this.tryFirstIssueCover(series.id) : null;
 
             mapped.push({
                 sourceId: series.id.toString(),
@@ -91,7 +117,8 @@ export class MetronProvider implements IMetadataProvider {
                 publisher: realPublisher,
                 universe: series.universe?.name || null,
                 description: series.desc || null,
-                coverUrl: coverUrl,
+                coverUrl: cover ?? null,
+                ...(cover === undefined ? { coverPending: true } : {}),
                 status: series.status?.name === 'Ended' ? 'Ended' : 'Ongoing',
                 issueCount: series.issue_count || 0
             });

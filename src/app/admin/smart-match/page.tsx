@@ -437,7 +437,9 @@ export default function SmartMatchPage() {
 
                 Logger.log(`[Smart Match Debug] Auto-scanning for "${query}" using provider: ${searchProvider}`, 'debug');
 
-                const res = await fetch(`/api/search?q=${encodeURIComponent(query)}&provider=${searchProvider}`);
+                // covers=none: the scan shows one suggestion per series, so it asks for that one's cover
+                // below instead of paying Metron for every result's (Metron beta 4).
+                const res = await fetch(`/api/search?q=${encodeURIComponent(query)}&provider=${searchProvider}&covers=none`);
                 
                 if (res.status === 429) {
                     throw new Error("FATAL_RATE_LIMIT");
@@ -449,10 +451,25 @@ export default function SmartMatchPage() {
                 // trusting results[0]. A best candidate that barely resembles the name becomes
                 // NOT_FOUND on purpose: Accept All takes any row with a suggestion, and a confident-
                 // looking wrong answer there costs a folder move to undo.
-                const picked = pickSuggestion(cleanName, wantedYear, data.results || []);
+                const results: { id: string | number; name?: string; year?: string | number | null; image?: string | null; metadataSource?: string }[] = data.results || [];
+                const picked = pickSuggestion(cleanName, wantedYear, results);
                 if (picked) {
                     setSuggestions(prev => ({ ...prev, [series.id]: picked }));
                     matchCount++;
+                    if (!picked.image && picked.metadataSource === 'METRON') {
+                        try {
+                            const coverRes = await fetch(`/api/search/cover?provider=METRON&id=${encodeURIComponent(picked.id)}`);
+                            const { image } = coverRes.ok ? await coverRes.json() : { image: null };
+                            if (image) {
+                                setSuggestions(prev => {
+                                    const current = prev[series.id];
+                                    return current && typeof current === 'object' && current.id === picked.id
+                                        ? { ...prev, [series.id]: { ...current, image } }
+                                        : prev;
+                                });
+                            }
+                        } catch { /* a cover is a nice-to-have */ }
+                    }
                 } else {
                     setSuggestions(prev => ({ ...prev, [series.id]: 'NOT_FOUND' }));
                 }

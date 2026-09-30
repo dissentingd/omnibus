@@ -3859,7 +3859,7 @@ mod tests {
         // ComicInfo.xml injection into the fixture cbz via metadata_writer), and the
         // updatedAt/lastMetadataSync bump through the per-dialect now/now-UTC expressions.
         let series_id_owned: String = row.get("id");
-        crate::metadata::sync_metadata(db.clone(), Some(vec![series_id_owned.clone()]))
+        crate::metadata::sync_metadata(db.clone(), Some(vec![series_id_owned.clone()]), false)
             .await
             .expect("sync_metadata through the Any pool");
 

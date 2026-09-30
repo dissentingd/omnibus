@@ -301,8 +301,53 @@ impl Drop for SyncClaim {
     }
 }
 
-pub async fn sync_metadata(db: Db, series_ids: Option<Vec<String>>) -> anyhow::Result<()> {
-    sync_metadata_attempt(db, series_ids, 0).await
+/// How one metadata sync runs.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct SyncOptions {
+    /// A targeted sync (series ids given - a refresh, a match, an import): re-check everything, with
+    /// no If-Modified-Since, no modified_gt and no Ended-and-complete shortcut. The scheduled sweep
+    /// gets those call-reduction paths.
+    pub full_fetch: bool,
+    /// A person asked, on a series' Refresh Metadata, for its per-issue Metron credits too (the
+    /// ask-with-a-count shown while the "per-issue credits" setting is off - Metron beta 4).
+    pub fetch_credits: bool,
+}
+
+impl SyncOptions {
+    pub(crate) fn for_request(series_ids: &Option<Vec<String>>, fetch_credits: bool) -> Self {
+        SyncOptions { full_fetch: series_ids.is_some(), fetch_credits }
+    }
+}
+
+/// Whether a sync runs the per-issue Metron detail pass (one /issue/{id}/ request per issue): when the
+/// "per-issue credits" setting (metron_detail_credits) is on, or a person asked for it on the Refresh
+/// button. A targeted sync alone - Accept All, a match, an import, a bulk refresh - no longer forces
+/// it (Metron beta 4: Metron asks clients not to fetch detail for every item of a list).
+fn runs_detail_pass(detail_credits_setting: bool, opts: SyncOptions) -> bool {
+    detail_credits_setting || opts.fetch_credits
+}
+
+/// A rate-limit re-queue continues its batch the way the batch ran: a halted scheduled sweep's tail
+/// stays incremental even though it now carries series ids (it used to come back as a full, targeted
+/// sync - no If-Modified-Since, no modified_gt, and the forced detail pass).
+fn retry_options(opts: SyncOptions) -> SyncOptions {
+    opts
+}
+
+/// The issues the detail pass fetches for a series (bind $1 = series id): Metron issues with a file on
+/// disk that don't have their details yet (not DEEP_SYNCED) and aren't hand-edited (locked - the merge
+/// would keep every column anyway). A missing issue gets its details when it's downloaded or opened.
+/// Node twin: src/lib/metron/credit-candidates.ts (the Refresh button's count must match).
+const DETAIL_PASS_CANDIDATES: &str = r#"SELECT id, "metadataId", number, name, writers, artists, "coverArtists", colorists, letterers, characters, teams, "storyArcs", inker, editor, translator
+           FROM "Issue"
+           WHERE "seriesId" = $1 AND "metadataSource" = 'METRON' AND "metadataId" IS NOT NULL
+             AND "filePath" IS NOT NULL AND "filePath" <> ''
+             AND "matchState" <> 'DEEP_SYNCED' AND CAST("hasCustomMetadata" AS INTEGER) = 0"#;
+
+/// `fetch_credits`: a person asked for per-issue Metron credits on this refresh (see SyncOptions).
+pub async fn sync_metadata(db: Db, series_ids: Option<Vec<String>>, fetch_credits: bool) -> anyhow::Result<()> {
+    let opts = SyncOptions::for_request(&series_ids, fetch_credits);
+    sync_metadata_attempt(db, series_ids, opts, 0).await
 }
 
 /// Boxed indirection for the retry recursion — an async fn cannot await itself directly; the
@@ -310,14 +355,15 @@ pub async fn sync_metadata(db: Db, series_ids: Option<Vec<String>>) -> anyhow::R
 fn sync_metadata_attempt_boxed(
     db: Db,
     series_ids: Option<Vec<String>>,
+    opts: SyncOptions,
     attempt: u32,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send>> {
-    Box::pin(sync_metadata_attempt(db, series_ids, attempt))
+    Box::pin(sync_metadata_attempt(db, series_ids, opts, attempt))
 }
 
 /// Body of [`sync_metadata`]. `rate_limit_attempt` counts how many times this batch has already
 /// re-queued itself after a provider rate-limit halt (0 = the original request).
-async fn sync_metadata_attempt(db: Db, series_ids: Option<Vec<String>>, rate_limit_attempt: u32) -> anyhow::Result<()> {
+async fn sync_metadata_attempt(db: Db, series_ids: Option<Vec<String>>, opts: SyncOptions, rate_limit_attempt: u32) -> anyhow::Result<()> {
     // ComicVine API key (Metron series don't need it, so this is optional).
     let cv_api_key: Option<String> = sqlx::query_scalar(r#"SELECT value FROM "SystemSetting" WHERE key = 'cv_api_key'"#)
         .fetch_optional(&db.pool)
@@ -382,8 +428,9 @@ async fn sync_metadata_attempt(db: Db, series_ids: Option<Vec<String>>, rate_lim
     // post-import enrichment) ALWAYS does a complete fetch: it never skips issue pagination for
     // "Ended" series and never uses incremental (modified_gt). Only the scheduled maintenance sweep
     // (series_ids = None) gets the call-reduction optimizations. This guarantees a human-requested
-    // refresh always re-checks every issue, even on a finished series.
-    let full_fetch = series_ids.is_some();
+    // refresh always re-checks every issue, even on a finished series. Decided once per batch
+    // (SyncOptions): a rate-limit retry keeps the original batch's mode.
+    let full_fetch = opts.full_fetch;
 
     // file_metadata_priority (discussion #177): provider syncs only fill blanks; embedded-file
     // metadata (ComicInfo.xml / series.json) is never overwritten unless the admin turns this off.
@@ -391,9 +438,11 @@ async fn sync_metadata_attempt(db: Db, series_ids: Option<Vec<String>>, rate_lim
         .fetch_optional(&db.pool).await.ok().flatten().as_deref() == Some("true");
 
     // metron_detail_credits (opt-in, quota-heavy): fetch per-issue credits via Metron detail calls —
-    // one /issue/{id}/ call per not-yet-deep-synced issue, gated against the 5,000/day window.
+    // one /issue/{id}/ call per owned issue still missing them, budgeted against the account's daily
+    // window. Off: only when a person asks on the Refresh button (runs_detail_pass).
     let metron_detail_credits: bool = sqlx::query_scalar::<_, String>(r#"SELECT value FROM "SystemSetting" WHERE key = 'metron_detail_credits'"#)
         .fetch_optional(&db.pool).await.ok().flatten().as_deref() == Some("true");
+    let run_detail_pass = runs_detail_pass(metron_detail_credits, opts);
 
     let mut ok_count = 0usize;
     let mut fail_count = 0usize;
@@ -446,7 +495,7 @@ async fn sync_metadata_attempt(db: Db, series_ids: Option<Vec<String>>, rate_lim
             "METRON" => {
                 fetch_metron(
                     &db, &client, &series_id, &series_name, &metadata_id, &folder_path, current_year, current_cover,
-                    last_sync.as_deref(), full_fetch, has_custom_cover, &cover_source, file_priority, metron_detail_credits,
+                    last_sync.as_deref(), full_fetch, has_custom_cover, &cover_source, file_priority, run_detail_pass,
                 ).await
             }
             other => {
@@ -508,21 +557,21 @@ async fn sync_metadata_attempt(db: Db, series_ids: Option<Vec<String>>, rate_lim
 
     // 2026-07-26 (worklist item 10 follow-up): a halted batch used to evaporate — the BullMQ job
     // completes as soon as the engine ACCEPTs, so nothing upstream ever retries. Re-queue the
-    // unfinished tail here (delayed, attempt-capped). A retried batch runs as TARGETED
-    // (Some(ids) ⇒ full_fetch): the original semantics for the match-time case, and a bounded
-    // upgrade for a halted sweep tail (≤15 ids, ≤MAX attempts).
+    // unfinished tail here (delayed, attempt-capped). A retried batch runs the way the original did
+    // (retry_options): a halted sweep tail stays incremental, a targeted batch stays full.
     if let Some(idx) = halted_at {
         match plan_rate_limit_retry(&all_ids, idx, rate_limit_attempt) {
             Some(retry_ids) => {
                 let attempt = rate_limit_attempt + 1;
                 let retry_db = db.clone();
+                let retry_opts = retry_options(opts);
                 log::info!(
                     "[Metadata Sync] Re-queuing {} rate-limit-halted series in {}s (attempt {}/{}).",
                     retry_ids.len(), RATE_LIMIT_RETRY_DELAY_SECS, attempt, MAX_RATE_LIMIT_RETRIES
                 );
                 tokio::spawn(async move {
                     tokio::time::sleep(Duration::from_secs(RATE_LIMIT_RETRY_DELAY_SECS)).await;
-                    if let Err(e) = sync_metadata_attempt_boxed(retry_db, Some(retry_ids), attempt).await {
+                    if let Err(e) = sync_metadata_attempt_boxed(retry_db, Some(retry_ids), retry_opts, attempt).await {
                         log::error!("[Metadata Sync] Rate-limit retry attempt {} failed: {:?}", attempt, e);
                     }
                 });
@@ -1107,7 +1156,8 @@ async fn fetch_metron(
     has_custom_cover: bool,
     cover_source: &str,
     file_priority: bool,
-    detail_credits: bool,
+    // The per-issue detail pass runs this sync (runs_detail_pass: the setting, or a person's ask).
+    run_detail_pass: bool,
 ) -> anyhow::Result<i32> {
     let auth = match metron_auth(&db.pool).await {
         Some(a) => a,
@@ -1226,8 +1276,7 @@ async fn fetch_metron(
         log::info!("[Metadata] {} is Ended and complete ({}/{}) — skipping Metron issue fetch.", series_name, local_count, metron_total);
         // Detail enrichment still runs on this shortcut path — otherwise an Ended-and-complete
         // series could never be backfilled after the admin enables metron_detail_credits.
-        // full_fetch (targeted match-time syncs) always qualifies — see the main-path gate below.
-        if detail_credits || full_fetch {
+        if run_detail_pass {
             metron_detail_credits_nonfatal(db, client, &auth, series_id, series_name, file_priority).await?;
         }
         return Ok(0);
@@ -1477,11 +1526,12 @@ async fn fetch_metron(
         }
     }
 
-    // #199 round 3: a targeted (full_fetch) sync always runs the detail pass — that's the
-    // match-time path, where the contract is "the right ID brings the real title + credits".
-    // The metron_detail_credits opt-in still decides for the scheduled sweep, and the daily
-    // budget guard inside the pass applies to both.
-    if detail_credits || full_fetch {
+    // The per-issue detail pass: the metron_detail_credits setting, or a person's ask on the Refresh
+    // button (runs_detail_pass). Since Metron beta 4 a targeted sync alone - a match, Accept All, an
+    // import - no longer forces it (#199 round 3 had it always run at match time); those issues get
+    // their details when the setting is on, when someone refreshes and says yes, or when one is
+    // opened. The daily budget guard inside the pass applies either way.
+    if run_detail_pass {
         metron_detail_credits_nonfatal(db, client, &auth, series_id, series_name, file_priority).await?;
     }
 
@@ -1522,9 +1572,9 @@ async fn metron_detail_credits_nonfatal(
 }
 
 /// Per-issue Metron detail enrichment — credits AND the story title (#199 round 3), since the
-/// issue_list endpoint carries neither; each issue costs one /issue/{id}/ detail call. Runs for
-/// every targeted (match-time) sync, and for the scheduled sweep only when the
-/// metron_detail_credits opt-in is set. Budget-gated against the account's daily Metron window (the
+/// issue_list endpoint carries neither; each issue costs one /issue/{id}/ detail call. Runs when the
+/// metron_detail_credits setting is on or a person asked on the Refresh button (runs_detail_pass), for
+/// owned issues only (DETAIL_PASS_CANDIDATES). Budget-gated against the account's daily Metron window (the
 /// limit Metron reports, which varies by donor tier) with a reserve so normal syncing never starves — issues left over stay
 /// non-DEEP_SYNCED and are picked up on the next sync (same deferral model as the unmatched sweep,
 /// discussion #177). Fetched credits merge through the never-wipe policy (issue #179) and the issue
@@ -1538,14 +1588,8 @@ async fn metron_detail_credit_pass(
     series_name: &str,
     file_priority: bool,
 ) -> anyhow::Result<(usize, usize)> {
-    // Locked (hasCustomMetadata) issues are excluded outright: the merge policy would keep every
-    // existing column anyway, so the detail call would be a pure quota burn.
-    let rows = sqlx::query(
-        r#"SELECT id, "metadataId", number, name, writers, artists, "coverArtists", colorists, letterers, characters, teams, "storyArcs"
-           FROM "Issue"
-           WHERE "seriesId" = $1 AND "metadataSource" = 'METRON' AND "metadataId" IS NOT NULL
-             AND "matchState" <> 'DEEP_SYNCED' AND CAST("hasCustomMetadata" AS INTEGER) = 0"#,
-    )
+    // Owned, not-yet-detailed, unlocked Metron issues (see DETAIL_PASS_CANDIDATES).
+    let rows = sqlx::query(DETAIL_PASS_CANDIDATES)
     .bind(series_id)
     .fetch_all(&db.pool)
     .await?;
@@ -2707,6 +2751,67 @@ mod tests {
         assert_eq!(detail_name_write(Some("Issue 154"), Some("Lifedeath".into()), "154", true), Some("Lifedeath".into()));
         // No real title in the detail → leave the column alone (COALESCE keeps the name).
         assert_eq!(detail_name_write(Some("Lifedeath"), None, "154", false), None);
+    }
+
+    // ==== Metron beta 4 (#216 follow-up): the per-issue detail pass (one /issue/{id}/ request per
+    // issue) ran on every targeted sync - Accept All, imports, the rate-limit re-queue - whatever the
+    // "per-issue credits" setting said, and fetched missing issues with no file too. It now fetches
+    // only issues on disk, and only when the setting is on or a person asked on the Refresh button.
+
+    #[test]
+    fn the_detail_pass_runs_on_the_setting_or_an_explicit_ask_never_just_because_a_sync_was_targeted() {
+        let targeted = SyncOptions::for_request(&Some(vec!["s1".into()]), false);
+        let asked = SyncOptions::for_request(&Some(vec!["s1".into()]), true);
+        let scheduled = SyncOptions::for_request(&None, false);
+        assert!(targeted.full_fetch && !scheduled.full_fetch);
+        assert!(!runs_detail_pass(false, targeted), "Accept All, an import, a bulk refresh: the setting decides");
+        assert!(!runs_detail_pass(false, scheduled));
+        assert!(runs_detail_pass(false, asked), "the Refresh button's ask");
+        assert!(runs_detail_pass(true, targeted) && runs_detail_pass(true, scheduled));
+    }
+
+    #[test]
+    fn a_rate_limit_retry_runs_like_the_batch_it_continues() {
+        // Before: the retried tail carried series ids, so a halted scheduled sweep came back as a
+        // full targeted sync (no If-Modified-Since, no modified_gt, and the forced detail pass).
+        let sweep = SyncOptions::for_request(&None, false);
+        assert_eq!(retry_options(sweep), sweep);
+        let refresh = SyncOptions::for_request(&Some(vec!["s1".into()]), true);
+        assert_eq!(retry_options(refresh), refresh);
+    }
+
+    #[tokio::test]
+    async fn detail_pass_candidates_are_metron_issues_on_disk_still_missing_details() {
+        static INIT: std::sync::Once = std::sync::Once::new();
+        INIT.call_once(sqlx::any::install_default_drivers);
+        let pool = sqlx::any::AnyPoolOptions::new().max_connections(1).connect("sqlite::memory:").await.unwrap();
+        sqlx::query(r#"CREATE TABLE "Issue" (id TEXT PRIMARY KEY, "seriesId" TEXT, "metadataSource" TEXT, "metadataId" TEXT,
+            number TEXT, name TEXT, "filePath" TEXT, "matchState" TEXT, "hasCustomMetadata" INTEGER DEFAULT 0,
+            writers TEXT, artists TEXT, "coverArtists" TEXT, colorists TEXT, letterers TEXT, characters TEXT, teams TEXT,
+            "storyArcs" TEXT, inker TEXT, editor TEXT, translator TEXT)"#).execute(&pool).await.unwrap();
+        for (id, series, source, meta, path, state, locked) in [
+            ("owned", "s1", "METRON", Some("9001"), Some("/lib/Saga 001.cbz"), "MATCHED", 0),  // the one to fetch
+            ("wanted", "s1", "METRON", Some("9002"), None, "MATCHED", 0),                      // missing - no file
+            ("blank", "s1", "METRON", Some("9003"), Some(""), "MATCHED", 0),                   // an empty path is no file
+            ("deep", "s1", "METRON", Some("9004"), Some("/lib/4.cbz"), "DEEP_SYNCED", 0),     // already has its details
+            ("locked", "s1", "METRON", Some("9005"), Some("/lib/5.cbz"), "MATCHED", 1),       // hand-edited
+            ("cv", "s1", "COMICVINE", Some("4000-6"), Some("/lib/6.cbz"), "MATCHED", 0),      // not Metron's
+            ("noid", "s1", "METRON", None, Some("/lib/8.cbz"), "MATCHED", 0),                 // nothing to ask for
+            ("other", "s2", "METRON", Some("9007"), Some("/lib/7.cbz"), "MATCHED", 0),        // another series
+        ] {
+            sqlx::query(r#"INSERT INTO "Issue" (id, "seriesId", "metadataSource", "metadataId", number, "filePath", "matchState", "hasCustomMetadata", inker)
+                           VALUES ($1, $2, $3, $4, '1', $5, $6, $7, 'An Inker')"#)
+                .bind(id).bind(series).bind(source).bind(meta).bind(path).bind(state).bind(locked)
+                .execute(&pool).await.unwrap();
+        }
+
+        let rows = sqlx::query(DETAIL_PASS_CANDIDATES).bind("s1").fetch_all(&pool).await.unwrap();
+
+        let ids: Vec<String> = rows.iter().map(|r| r.get("id")).collect();
+        assert_eq!(ids, vec!["owned".to_string()]);
+        // The fill-blanks rule reads inker/editor/translator from this row too - the query left them
+        // out, so file_metadata_priority never protected those three columns.
+        assert_eq!(rows[0].try_get::<Option<String>, _>("inker").ok().flatten().as_deref(), Some("An Inker"));
     }
 
     #[test]

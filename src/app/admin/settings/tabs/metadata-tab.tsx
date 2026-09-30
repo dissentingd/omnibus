@@ -202,7 +202,7 @@ export function MetadataTab({ s }: { s: SettingsBag }) {
                                     Metron: Fetch Per-Issue Credits
                                 </Label>
                                 <p className="text-[11px] text-muted-foreground">
-                                    Metron&apos;s issue list carries no creator credits, so syncs normally leave them to ComicInfo.xml or on-demand lookups. When on, metadata syncs make one extra Metron API call per issue to fill in writers, artists, characters and story arcs — quota-heavy on large libraries (budgeted against Metron&apos;s 5,000/day limit; leftovers resume on the next sync). Each issue is only fetched once.
+                                    Metron&apos;s issue list carries no creator credits, so syncs normally leave them to ComicInfo.xml, to opening an issue (which fetches its own), or to a series&apos; Refresh Metadata (which asks first, with the count). When on, every metadata sync - scheduled, matches, imports - makes one extra Metron request per issue you have on disk to fill in writers, artists, characters, story arcs and story titles. Quota-heavy on large libraries: budgeted against your Metron daily limit, leftovers resume on the next sync, and each issue is only fetched once.
                                 </p>
                             </div>
                         </div>
