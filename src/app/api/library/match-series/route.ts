@@ -26,6 +26,7 @@ import { cachedCvGet } from '@/lib/metadata/metadata-cache';
 import { findLocalCoverBasename } from '@/lib/utils/cover-plan';
 import { parseComicVineCredits } from '@/lib/utils';
 import { folderOwner, suggestFreeFolderName, attachAsCollected } from '@/lib/match-collision';
+import { replaceNamingToken } from '@/lib/utils/naming';
 
 // #199 round 4 Beta B: only non-empty credit groups become columns (never write a literal '[]' —
 // issue #179), stringified to the Issue JSON-array convention.
@@ -82,7 +83,7 @@ export async function POST(request: Request) {
     if (session?.user?.role !== 'ADMIN') return NextResponse.json({ error: "Unauthorized" }, { status: 403 });
     const req = (await request.json()) as any;
     const { oldFolderPath, cvId, metadataId, metadataSource, name, year, publisher, exactIssueId, exactIssueNumber,
-            universe, seriesGroup, description, lockMetadata, writeToFile, coverImageBase64, issueCoverImageBase64, issueCoverEmbed,
+            universe, seriesGroup, imprint, description, lockMetadata, writeToFile, coverImageBase64, issueCoverImageBase64, issueCoverEmbed,
             dataMode, issueTitle } = req;
 
     const targetMetaId = metadataId ? metadataId.toString() : (cvId ? cvId.toString() : null);
@@ -178,6 +179,20 @@ export async function POST(request: Request) {
         where: { folderPath: oldFolderPath }
     });
 
+    // Imprint is a series-level ComicInfo field. An explicit request value, including an empty
+    // value, wins; an omitted value preserves the existing matched/unmatched series value so a
+    // routine re-match cannot silently remove an imprint folder tier.
+    const storedImprint = existingRecord?.imprint?.trim()
+        ? existingRecord.imprint
+        : (unmatchedRecord?.imprint ?? existingRecord?.imprint ?? '');
+    const effectiveImprint = imprint !== undefined ? imprint : storedImprint;
+    const safeImprint = effectiveImprint ? sanitizeFilename(effectiveImprint) : '';
+    // A merge deletes the source row. Retain any imprint adopted from it on the surviving
+    // series so subsequent Standardize runs use the same value as this move.
+    const adoptedImprint = imprint === undefined && existingRecord && !existingRecord.imprint?.trim()
+        ? unmatchedRecord?.imprint?.trim()
+        : undefined;
+
     // NEVER-DEMOTE manga resolution (2026-07-25 worklist item 5): a context-free re-detection from
     // name+publisher+year used to overwrite isManga and physically move manga-library series into
     // the Comics library on every match. The admin's library placement and any existing DB rows are
@@ -203,13 +218,15 @@ export async function POST(request: Request) {
     const config = Object.fromEntries(settings.map(s => [s.key, s.value]));
     const folderPattern = config.folder_naming_pattern || "{Publisher}/{Series} ({Year})";
 
-    const relFolderPath = folderPattern
+    let relFolderPath = folderPattern
         .replace(/{Publisher}/gi, safePublisher || "Other")
         .replace(/{Series}/gi, safeName || "Unknown Series")
         .replace(/{Year}/gi, safeYear)
         .replace(/{VolumeYear}/gi, safeYear)
         .replace(/{UniverseName}/gi, safeUniverse)
-        .replace(/{SeriesGroup}/gi, safeSeriesGroup)
+        .replace(/{SeriesGroup}/gi, safeSeriesGroup);
+
+    relFolderPath = replaceNamingToken(relFolderPath, '{Imprint}', safeImprint)
         .replace(/\(\s*\)/g, '')
         .replace(/\[\s*\]/g, '')
         .replace(/\s+/g, ' ')
@@ -341,6 +358,7 @@ export async function POST(request: Request) {
         // #199 ComicInfo defaults — the shared fragment (also used by the series editor's
         // library/update) applies the undefined-means-untouched contract, list-to-JSON-array
         // conversion, number validation, and the two-way B&W semantics in one place.
+        ...(adoptedImprint ? { imprint: adoptedImprint } : {}),
         ...comicInfoDefaultsUpdateFragment(req),
         ...(lockMetadata ? { hasCustomMetadata: true } : {})
     };
@@ -484,7 +502,7 @@ export async function POST(request: Request) {
                     const issueYear = existingRecord ? (existingRecord.year?.toString() || safeYear) : safeYear;
                         
                     // Use finalExt so the rename applies the verified extension
-                    const newFileName = filePatternToUse
+                    let newFileName = filePatternToUse
                         .replace(/{Publisher}/gi, safePublisher || "Other")
                         .replace(/{Series}/gi, safeName)
                         .replace(/{Year}/gi, safeYear)
@@ -492,7 +510,9 @@ export async function POST(request: Request) {
                         .replace(/{IssueYear}/gi, issueYear)
                         .replace(/{Issue}/gi, formattedNum)
                         .replace(/{UniverseName}/gi, safeUniverse)
-                        .replace(/{SeriesGroup}/gi, safeSeriesGroup)
+                        .replace(/{SeriesGroup}/gi, safeSeriesGroup);
+
+                    newFileName = replaceNamingToken(newFileName, '{Imprint}', safeImprint)
                         .replace(/\(\s*\)/g, '').replace(/\[\s*\]/g, '').replace(/\s+/g, ' ').trim() + finalExt;
                     
                     const oldFilePath = path.join(activeFolderPath, file);
