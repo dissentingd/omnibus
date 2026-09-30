@@ -8,7 +8,7 @@ import AdmZip from 'adm-zip';
 // Logger writes to disk/console; stub it. Everything else runs against REAL archives in a temp dir —
 // the whole point is proving the fast central-directory count agrees with what the reader serves.
 
-import { countArchivePages, isPageCountable, isEngineCountable } from '@/lib/utils/archive-pages';
+import { countArchivePages, listArchivePages, readZipEntryNames, isPageCountable, isEngineCountable } from '@/lib/utils/archive-pages';
 
 let root: string;
 
@@ -98,5 +98,98 @@ describe('countArchivePages', () => {
         const corrupt = path.join(root, 'corrupt.cbz');
         await fs.writeFile(corrupt, Buffer.from('this is definitely not a zip archive, not even close'));
         expect(await countArchivePages(corrupt)).toBe(0);
+    });
+
+    it('counts a ZIP64 archive (files over 4 GB)', async () => {
+        const filePath = writeZip64Index('big.cbz', ['p1.jpg', 'p2.jpg', 'p3.png', 'ComicInfo.xml']);
+        expect(await countArchivePages(filePath)).toBe(3);
+    });
+});
+
+// A ZIP64 archive the size of a real compendium can't live in a test, but the index reader only
+// reads the end records and the central directory - so this writes exactly those (ZIP64 end
+// record, its locator, and a classic end record whose fields all say "see ZIP64"), behind a
+// stand-in data region. AdmZip can parse this too, but only by reading the whole file into memory,
+// which is what fails on a real file over 2 GB - so the ZIP64 cases target readZipEntryNames (the
+// index alone, no fallback) directly.
+function writeZip64Index(name: string, names: string[]): string {
+    const data = Buffer.from('stand-in for the compressed pages');
+    const headers = names.map(n => {
+        const nameBuf = Buffer.from(n, 'utf8');
+        const h = Buffer.alloc(46);
+        h.writeUInt32LE(0x02014b50, 0);   // central directory file header
+        h.writeUInt16LE(45, 4);           // version made by
+        h.writeUInt16LE(45, 6);           // version needed (ZIP64)
+        h.writeUInt16LE(0x0800, 8);       // UTF-8 names
+        h.writeUInt16LE(nameBuf.length, 28);
+        return Buffer.concat([h, nameBuf]);
+    });
+    const cd = Buffer.concat(headers);
+    const cdOffset = data.length;
+
+    const z64 = Buffer.alloc(56);
+    z64.writeUInt32LE(0x06064b50, 0);     // ZIP64 end of central directory record
+    z64.writeBigUInt64LE(BigInt(44), 4);
+    z64.writeUInt16LE(45, 12);
+    z64.writeUInt16LE(45, 14);
+    z64.writeBigUInt64LE(BigInt(names.length), 24);
+    z64.writeBigUInt64LE(BigInt(names.length), 32);
+    z64.writeBigUInt64LE(BigInt(cd.length), 40);
+    z64.writeBigUInt64LE(BigInt(cdOffset), 48);
+
+    const locator = Buffer.alloc(20);
+    locator.writeUInt32LE(0x07064b50, 0); // ZIP64 end of central directory locator
+    locator.writeBigUInt64LE(BigInt(cdOffset + cd.length), 8);
+    locator.writeUInt32LE(1, 16);
+
+    const eocd = Buffer.alloc(22);
+    eocd.writeUInt32LE(0x06054b50, 0);    // classic end record: every field defers to ZIP64
+    eocd.writeUInt16LE(0xffff, 4);
+    eocd.writeUInt16LE(0xffff, 6);
+    eocd.writeUInt16LE(0xffff, 8);
+    eocd.writeUInt16LE(0xffff, 10);
+    eocd.writeUInt32LE(0xffffffff, 12);
+    eocd.writeUInt32LE(0xffffffff, 16);
+
+    const filePath = path.join(root, name);
+    fs.writeFileSync(filePath, Buffer.concat([data, cd, z64, locator, eocd]));
+    return filePath;
+}
+
+describe('listArchivePages', () => {
+    it('lists exactly the page entries AdmZip would, names byte-for-byte (the reader looks pages up by name)', async () => {
+        const filePath = buildCbz('listed.cbz', {
+            'page_002.jpg': 'b',
+            'page_001.jpg': 'a',
+            'Spawn - Café #01/page_003.png': 'c', // non-ASCII + nested: the name must match AdmZip's
+            'ComicInfo.xml': '<ComicInfo/>',
+            '__MACOSX/page_001.jpg': 'junk',
+            'notes.txt': 'junk',
+        });
+        const admNames = new AdmZip(filePath).getEntries()
+            .filter(e => !e.isDirectory && !e.entryName.toLowerCase().includes('__macosx') && /\.(jpg|jpeg|png|webp|gif|bmp)$/i.test(e.entryName))
+            .map(e => e.entryName);
+
+        const names = await listArchivePages(filePath);
+        expect([...names].sort()).toEqual([...admNames].sort());
+        expect(names).toContain('Spawn - Café #01/page_003.png');
+    });
+
+    it('reads a ZIP64 archive from its index alone', async () => {
+        const filePath = writeZip64Index('compendium.cbz', ['Vol 1/001.jpg', 'Vol 1/002.jpg', '__MACOSX/001.jpg', 'ComicInfo.xml']);
+        expect(await readZipEntryNames(filePath)).toEqual(['Vol 1/001.jpg', 'Vol 1/002.jpg', '__MACOSX/001.jpg', 'ComicInfo.xml']);
+        expect(await listArchivePages(filePath)).toEqual(['Vol 1/001.jpg', 'Vol 1/002.jpg']);
+    });
+
+    it('lists a regular zip from its index alone, matching AdmZip', async () => {
+        const filePath = buildCbz('indexed.cbz', { 'b.jpg': 'b', 'a.jpg': 'a', 'x/ComicInfo.xml': '<ComicInfo/>' });
+        const admNames = new AdmZip(filePath).getEntries().map(e => e.entryName);
+        expect([...(await readZipEntryNames(filePath))].sort()).toEqual([...admNames].sort());
+    });
+
+    it('throws for an archive nothing can read, so the reader can say so', async () => {
+        const corrupt = path.join(root, 'corrupt.cbz');
+        await fs.writeFile(corrupt, Buffer.from('this is definitely not a zip archive, not even close'));
+        await expect(listArchivePages(corrupt)).rejects.toThrow();
     });
 });

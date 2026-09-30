@@ -33,6 +33,7 @@ import PageManagerModal from "@/components/page-manager-modal"
 import { AttachedVolumesManager } from "@/components/attached-volumes-manager"
 import { FolderCollisionDialog, type FolderCollision, type CollisionResolution } from "@/components/folder-collision-dialog"
 import { CoverageField } from "@/components/coverage-field"
+import { CollectedReadButton, CollectedProgressBadge } from "@/components/collected-read-button"
 import { CoveredIssuesSection } from "@/components/covered-issues-section"
 import { requestNameFor } from "@/lib/utils/request-name"
 import { hasMetronCredentials } from "@/lib/metron/credentials"
@@ -1766,10 +1767,11 @@ function SeriesContent() {
                                           activeIssue?.id === book.id ? "border-primary ring-2 ring-primary/30" : "border-border"
                                       )}
                                   >
-                                      <div className="w-12 h-[68px] shrink-0 rounded overflow-hidden bg-muted border border-border">
+                                      <div className="w-12 h-[68px] shrink-0 rounded overflow-hidden bg-muted border border-border relative">
                                           {book.coverUrl
                                               ? <img src={book.coverUrl} alt="" className="w-full h-full object-cover" onError={coverImgError(seriesInfo.cover)} />
                                               : null}
+                                          {owned && <CollectedProgressBadge book={book} />}
                                       </div>
                                       <div className="min-w-0 flex-1">
                                           <p className="text-sm font-bold text-foreground truncate" title={book.name}>{book.name}</p>
@@ -1784,6 +1786,8 @@ function SeriesContent() {
                                               className="mt-1"
                                           />
                                       </div>
+                                      {/* #215: an owned collection reads like any issue — straight into the reader. */}
+                                      {owned && <CollectedReadButton book={book} seriesFolder={folderPath || ''} />}
                                       {/* Collections sit outside the run's missing-issue math, so they
                                           need their own way to be asked for — searched by the book's
                                           own title, never as "{Series} #N". */}

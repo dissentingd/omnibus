@@ -5,10 +5,12 @@
 // file enters or changes in the library — the web reader hides a missing count because it re-lists
 // the archive on every open, but OPDS cannot.
 //
-// The counter reads ONLY the zip End-Of-Central-Directory + central directory (a tail seek of at most
-// ~64KB plus the directory itself) instead of loading the whole archive like AdmZip does — cheap
-// enough to run across thousands of issues in a scan sweep. AdmZip remains the fallback for archives
-// the fast path can't parse (ZIP64, odd trailers).
+// The counter and the reader's page lister read ONLY the zip End-Of-Central-Directory + central
+// directory (a tail seek of at most ~64KB plus the directory itself) instead of loading the whole
+// archive like AdmZip does — cheap enough to run across thousands of issues in a scan sweep, and the
+// only way to open a compendium over 2 GB at all (AdmZip reads the file into one buffer). ZIP64
+// archives (over 4 GB) are read from their ZIP64 end record. AdmZip remains the fallback for archives
+// the index reader can't parse (odd trailers).
 import fs from 'fs';
 import path from 'path';
 import AdmZip from 'adm-zip';
@@ -62,9 +64,16 @@ function isPageEntry(entryName: string): boolean {
 
 const EOCD_SIG = 0x06054b50;
 const CDFH_SIG = 0x02014b50;
+const ZIP64_LOCATOR_SIG = 0x07064b50;
+const ZIP64_EOCD_SIG = 0x06064b50;
 const MAX_COMMENT = 65535;
 
-async function countViaCentralDirectory(filePath: string): Promise<number> {
+/**
+ * Every entry name in a zip, read from its central directory alone (ZIP64-aware). Names are decoded
+ * as UTF-8, exactly like AdmZip's default decoder, because the reader looks pages up by the names
+ * the page list returns. Throws when the index can't be parsed — callers pick their fallback.
+ */
+export async function readZipEntryNames(filePath: string): Promise<string[]> {
     const fd = await fs.promises.open(filePath, 'r');
     try {
         const { size } = await fd.stat();
@@ -80,29 +89,59 @@ async function countViaCentralDirectory(filePath: string): Promise<number> {
         }
         if (eocd === -1) throw new Error('EOCD signature not found');
 
-        const totalEntries = tail.readUInt16LE(eocd + 10);
-        const cdSize = tail.readUInt32LE(eocd + 12);
-        const cdOffset = tail.readUInt32LE(eocd + 16);
+        let totalEntries = tail.readUInt16LE(eocd + 10);
+        let cdSize = tail.readUInt32LE(eocd + 12);
+        let cdOffset = tail.readUInt32LE(eocd + 16);
         if (totalEntries === 0xffff || cdSize === 0xffffffff || cdOffset === 0xffffffff) {
-            throw new Error('ZIP64 archive'); // fall back to AdmZip
+            // ZIP64: the locator sits just before the classic end record and points at the ZIP64 end
+            // record, which carries the real 64-bit entry count, directory size and offset.
+            const eocdPos = size - tailLen + eocd;
+            if (eocdPos < 20) throw new Error('ZIP64 locator missing');
+            const locator = Buffer.alloc(20);
+            await fd.read(locator, 0, 20, eocdPos - 20);
+            if (locator.readUInt32LE(0) !== ZIP64_LOCATOR_SIG) throw new Error('ZIP64 locator missing');
+            const z64 = Buffer.alloc(56);
+            await fd.read(z64, 0, 56, Number(locator.readBigUInt64LE(8)));
+            if (z64.readUInt32LE(0) !== ZIP64_EOCD_SIG) throw new Error('ZIP64 end record missing');
+            totalEntries = Number(z64.readBigUInt64LE(32));
+            cdSize = Number(z64.readBigUInt64LE(40));
+            cdOffset = Number(z64.readBigUInt64LE(48));
         }
+        if (cdOffset + cdSize > size) throw new Error('central directory out of range');
 
         const cd = Buffer.alloc(cdSize);
         await fd.read(cd, 0, cdSize, cdOffset);
 
-        let pos = 0, seen = 0, count = 0;
-        while (seen < totalEntries && pos + 46 <= cdSize) {
+        const names: string[] = [];
+        let pos = 0;
+        while (names.length < totalEntries && pos + 46 <= cdSize) {
             if (cd.readUInt32LE(pos) !== CDFH_SIG) throw new Error('corrupt central directory');
             const nameLen = cd.readUInt16LE(pos + 28);
             const extraLen = cd.readUInt16LE(pos + 30);
             const commentLen = cd.readUInt16LE(pos + 32);
-            if (isPageEntry(cd.toString('utf8', pos + 46, pos + 46 + nameLen))) count++;
+            names.push(cd.toString('utf8', pos + 46, pos + 46 + nameLen));
             pos += 46 + nameLen + extraLen + commentLen;
-            seen++;
         }
-        return count;
+        return names;
     } finally {
         await fd.close();
+    }
+}
+
+/**
+ * The readable page entries of a zip-family archive, in archive order (callers sort). Reads the
+ * index only; AdmZip is the fallback for an archive the index reader can't parse. Throws when
+ * neither can read it, so the reader can report a broken archive.
+ */
+export async function listArchivePages(filePath: string): Promise<string[]> {
+    try {
+        return (await readZipEntryNames(filePath)).filter(isPageEntry);
+    } catch (indexErr) {
+        try {
+            return new AdmZip(filePath).getEntries().filter(e => !e.isDirectory && isPageEntry(e.entryName)).map(e => e.entryName);
+        } catch (zipErr) {
+            throw new Error(`${getErrorMessage(zipErr)} (index: ${getErrorMessage(indexErr)})`);
+        }
     }
 }
 
@@ -115,7 +154,7 @@ async function countViaCentralDirectory(filePath: string): Promise<number> {
 export async function countArchivePages(filePath: string | null | undefined): Promise<number> {
     if (!filePath || !isPageCountable(filePath) || !fs.existsSync(filePath)) return 0;
     try {
-        return await countViaCentralDirectory(filePath);
+        return (await readZipEntryNames(filePath)).filter(isPageEntry).length;
     } catch (fastErr) {
         try {
             const zip = new AdmZip(filePath);
