@@ -7,6 +7,7 @@
 // as the response they point at (OPDS 1.2 §5.3).
 import fs from 'fs';
 import path from 'path';
+import { Readable } from 'stream';
 
 /**
  * Extension → media type. `.cbz`/`.cbr`/`.cb7` use the comic-book types, the rest the standard
@@ -93,15 +94,12 @@ export function ifRangeMatches(header: string | null | undefined, validators: { 
 }
 
 function streamFile(filePath: string, range?: { start: number; end: number }): ReadableStream {
-    const stream = fs.createReadStream(filePath, range);
-    return new ReadableStream({
-        start(controller) {
-            stream.on('data', (chunk) => controller.enqueue(chunk));
-            stream.on('end', () => controller.close());
-            stream.on('error', (err) => controller.error(err));
-        },
-        cancel() { stream.destroy(); },
-    });
+    // `Readable.toWeb` carries the read stream's own backpressure: the platform pulls a chunk only
+    // when the response can take it. The previous `on('data')` handler enqueued every chunk whatever
+    // the controller's `desiredSize`, so nothing ever paused the read — with a slow client the server
+    // read the rest of the file into memory ahead of it, which a 1–2 GB compendium does not forgive.
+    // Errors and cancellation are the wrapper's too, so a client that disconnects destroys the read.
+    return Readable.toWeb(fs.createReadStream(filePath, range)) as unknown as ReadableStream;
 }
 
 /**

@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { Readable } from 'stream';
 import { GET } from '@/app/api/library/download/route';
 
 // 1. Hoist our mocks
@@ -94,7 +95,7 @@ describe('API Route: Library File Download Permissions', () => {
         mocks.existsSync.mockReturnValueOnce(true);
         const fs = (await import('fs')).default as any;
         fs.statSync.mockReturnValueOnce({ size: 1234, mtime: new Date('2026-01-01T00:00:00Z') });
-        fs.createReadStream.mockReturnValueOnce({ on: vi.fn(), destroy: vi.fn() });
+        fs.createReadStream.mockReturnValueOnce(Readable.from([]));
 
         const res = await GET(createReq('/library/Batman/issue1.cbz'));
 
@@ -121,7 +122,7 @@ describe('API Route: Library File Download - response shape', () => {
         mocks.findUniqueUser.mockResolvedValue({ id: 'user_2', role: 'USER', canDownload: true });
         mocks.existsSync.mockReturnValue(true);
         mocks.statSync.mockReturnValue({ size: SIZE, mtime: MTIME });
-        mocks.createReadStream.mockReturnValue({ on: vi.fn(), destroy: vi.fn() });
+        mocks.createReadStream.mockReturnValue(Readable.from([]));
     });
 
     it('declares the media type from the file extension', async () => {

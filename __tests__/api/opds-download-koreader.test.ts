@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { Readable } from 'stream';
 
 // #211 follow-up: an OPDS download records the document IDs KOReader will send for that file (its
 // partial-MD5 checksum and filename MD5), so the device's progress syncs find the issue on their own.
@@ -48,7 +49,7 @@ describe('GET /api/opds/download - KOReader document IDs', () => {
         mocks.issueFindUnique.mockResolvedValue({ id: 'issue_1', filePath: FILE, series: { libraryId: 'lib_1' } });
         mocks.remember.mockResolvedValue(undefined);
         fsMocks.statSync.mockReturnValue({ size: SIZE, mtime: MTIME });
-        fsMocks.createReadStream.mockReturnValue({ on: vi.fn(), destroy: vi.fn() });
+        fsMocks.createReadStream.mockReturnValue(Readable.from([]));
     });
 
     it('records them for the issue it serves', async () => {
@@ -73,7 +74,7 @@ describe('GET /api/opds/download - media type, disposition and Range (#219, #220
         mocks.remember.mockResolvedValue(undefined);
         fsMocks.existsSync.mockReturnValue(true);
         fsMocks.statSync.mockReturnValue({ size: SIZE, mtime: MTIME });
-        fsMocks.createReadStream.mockReturnValue({ on: vi.fn(), destroy: vi.fn() });
+        fsMocks.createReadStream.mockReturnValue(Readable.from([]));
     });
 
     it('answers 200 with the whole file and advertises byte ranges when no Range is sent', async () => {
