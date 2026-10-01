@@ -3,12 +3,10 @@ import { prisma } from '@/lib/db';
 import { validateApiKey } from '@/lib/api-auth';
 import { getErrorMessage } from '@/lib/utils/error';
 import { Logger } from '@/lib/logger';
-import { escapeXml } from '@/lib/utils/xml';
 import { getAccessibleLibraryIds, seriesAccessWhere } from '@/lib/library-access';
 import { getPublicBaseUrl } from '@/lib/opds-base-url';
-import { opdsCoverLinks } from '@/lib/opds-covers';
-import { authorElements, entryUpdated, feedContentType, feedUpdated, publisherElement } from '@/lib/opds-feed';
-import { seriesAuthors } from '@/lib/komga/dto';
+import { escapeXml } from '@/lib/utils/xml';
+import { atomFeed, feedContentType, feedUpdated, seriesEntry } from '@/lib/opds-feed';
 
 export const dynamic = 'force-dynamic';
 
@@ -25,10 +23,15 @@ export async function GET(req: Request) {
     const limit = 50;
     const skip = (page - 1) * limit;
 
-    // Fetch Series with Pagination (per-library access: non-admins only see granted libraries)
+    // Fetch Series with Pagination (per-library access: non-admins only see granted libraries).
+    // `?library=<id>` — what a root "Libraries" entry links to — narrows it further, but as a clause
+    // ANDed inside the grants, so it can only ever narrow what the caller may already see.
     const accessibleLibs = await getAccessibleLibraryIds(auth.user?.id, auth.user?.role);
+    const libraryId = url.searchParams.get('library');
     const seriesList = await prisma.series.findMany({
-        where: seriesAccessWhere(accessibleLibs),
+        where: libraryId
+            ? { AND: [seriesAccessWhere(accessibleLibs), { libraryId }] }
+            : seriesAccessWhere(accessibleLibs),
         skip,
         take: limit + 1,
         // `id` tiebreaker (v1.4.1): OFFSET pagination needs a total order — on PostgreSQL, bare
@@ -42,37 +45,28 @@ export async function GET(req: Request) {
     const hasNext = seriesList.length > limit;
     const items = hasNext ? seriesList.slice(0, limit) : seriesList;
 
-    const entries = items.map(s => {
-        // Covers go through the OPDS-key cover route (lib/opds-covers.ts): the library cover route
-        // needs a web session, which an OPDS client never has.
-        const coverLinks = s.coverUrl || s.folderPath ? opdsCoverLinks(baseUrl, 'series', s.id) : '';
+    const entries = items.map(s => seriesEntry(baseUrl, s)).join('');
 
-        return `
-  <entry>
-    <title>${escapeXml(s.name)}</title>
-    <id>urn:omnibus:series:${s.id}</id>
-    <updated>${entryUpdated(s.updatedAt)}</updated>
-    ${authorElements(seriesAuthors(s))}
-    ${publisherElement(s.publisher)}
-    <content type="text">${escapeXml(s.description || 'No description available.')}</content>
-    ${coverLinks}
-    <link rel="subsection" href="${baseUrl}/api/opds/series/${s.id}" type="application/atom+xml;profile=opds-catalog;kind=acquisition"/>
-  </entry>`;
-    }).join('');
+    const scope = libraryId ? `library=${encodeURIComponent(libraryId)}` : '';
+    const pageHref = (p: number) => `${baseUrl}/api/opds/series?page=${p}${scope ? `&${scope}` : ''}`;
+    const kind = 'application/atom+xml;profile=opds-catalog;kind=navigation';
+    const links = [
+        `<link rel="self" href="${escapeXml(pageHref(page))}" type="${kind}"/>`,
+        `<link rel="start" href="${baseUrl}/api/opds" type="${kind}"/>`,
+        `<link rel="up" href="${baseUrl}/api/opds" type="${kind}"/>`,
+        hasNext ? `<link rel="next" href="${escapeXml(pageHref(page + 1))}" type="${kind}"/>` : '',
+        page > 1 ? `<link rel="previous" href="${escapeXml(pageHref(page - 1))}" type="${kind}"/>` : '',
+    ].filter(Boolean).join('\n  ');
 
-    const xml = `<?xml version="1.0" encoding="UTF-8"?>
-<feed xmlns="http://www.w3.org/2005/Atom" xmlns:opds="http://opds-spec.org/2010/catalog" xmlns:dc="http://purl.org/dc/elements/1.1/">
-  <id>urn:omnibus:series</id>
-  <title>All Series</title>
-  <updated>${feedUpdated(items.map(s => s.updatedAt))}</updated>
-  <author><name>Omnibus</name></author>
-  <link rel="self" href="${baseUrl}/api/opds/series?page=${page}" type="application/atom+xml;profile=opds-catalog;kind=navigation"/>
-  <link rel="start" href="${baseUrl}/api/opds" type="application/atom+xml;profile=opds-catalog;kind=navigation"/>
-  <link rel="up" href="${baseUrl}/api/opds" type="application/atom+xml;profile=opds-catalog;kind=navigation"/>
-  ${hasNext ? `<link rel="next" href="${baseUrl}/api/opds/series?page=${page + 1}" type="application/atom+xml;profile=opds-catalog;kind=navigation"/>` : ''}
-  ${page > 1 ? `<link rel="previous" href="${baseUrl}/api/opds/series?page=${page - 1}" type="application/atom+xml;profile=opds-catalog;kind=navigation"/>` : ''}
-  ${entries}
-</feed>`;
+    const xml = atomFeed({
+        // A single library's list is its own feed, not page 1 of the whole catalog.
+        id: libraryId ? `urn:omnibus:series:library:${escapeXml(libraryId)}` : 'urn:omnibus:series',
+        title: 'All Series',
+        updated: feedUpdated(items.map(s => s.updatedAt)),
+        links,
+        entries,
+        namespaces: ' xmlns:dc="http://purl.org/dc/elements/1.1/"',
+    });
 
     return new Response(xml, { headers: { 'Content-Type': feedContentType('navigation') } });
     } catch (error: unknown) {

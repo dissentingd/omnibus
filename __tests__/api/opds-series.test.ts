@@ -11,6 +11,7 @@ const mocks = vi.hoisted(() => ({
     validateApiKey: vi.fn(),
     findUniqueSeries: vi.fn(),
     updateIssue: vi.fn(),
+    readProgress: vi.fn().mockResolvedValue([]),
     countArchivePages: vi.fn(),
     countArchivePagesViaEngine: vi.fn(),
 }));
@@ -20,6 +21,7 @@ vi.mock('@/lib/db', () => ({
     prisma: {
         series: { findUnique: mocks.findUniqueSeries },
         issue: { update: mocks.updateIssue },
+        readProgress: { findMany: mocks.readProgress },
     }
 }));
 vi.mock('@/lib/library-access', () => ({
@@ -237,5 +239,26 @@ describe('API Route: OPDS Series Feed — entry conformance', () => {
         const { xml } = await feedFor({ id: 'u1', role: 'ADMIN' }, { issues: [issue()] });
 
         expect(xml).toContain('rel="http://vaemendis.net/opds-pse/stream" type="image/webp"');
+    });
+
+    // #221 point 3: a page-streaming client resumes where this user stopped. The stored currentPage
+    // is the app's 0-based index, so the attribute carries the 1-based page number OPDS-PSE expects.
+    it('adds pse:lastRead / pse:lastReadDate from the caller\'s own progress', async () => {
+        mocks.readProgress.mockResolvedValue([
+            { issueId: 'iss_1', currentPage: 6, updatedAt: new Date('2026-09-27T12:00:00.000Z') },
+        ]);
+
+        const { xml } = await feedFor({ id: 'u1', role: 'ADMIN' }, { issues: [issue({ id: 'iss_1' })] });
+
+        expect(xml).toContain('pse:lastRead="7"');
+        expect(xml).toContain('pse:lastReadDate="2026-09-27T12:00:00.000Z"');
+    });
+
+    it('omits the read attributes for an issue the caller has not started', async () => {
+        mocks.readProgress.mockResolvedValue([]);
+
+        const { xml } = await feedFor({ id: 'u1', role: 'ADMIN' }, { issues: [issue()] });
+
+        expect(xml).not.toContain('pse:lastRead');
     });
 });

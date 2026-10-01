@@ -18,6 +18,7 @@ const mocks = vi.hoisted(() => ({
     seriesFindMany: vi.fn(),
     issueFindUnique: vi.fn(),
     issueUpdate: vi.fn(),
+    readProgress: vi.fn().mockResolvedValue([]),
     canAccessLibraryId: vi.fn(),
     coverGet: vi.fn(),
 }));
@@ -27,6 +28,7 @@ vi.mock('@/lib/db', () => ({
     prisma: {
         series: { findUnique: mocks.seriesFindUnique, findMany: mocks.seriesFindMany },
         issue: { findUnique: mocks.issueFindUnique, update: mocks.issueUpdate },
+        readProgress: { findMany: mocks.readProgress },
     },
 }));
 vi.mock('@/lib/library-access', () => ({
