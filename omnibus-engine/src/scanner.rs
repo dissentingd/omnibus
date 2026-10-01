@@ -344,13 +344,21 @@ fn parse_series_json(content: &str) -> Option<SeriesJsonInfo> {
                 .collect()
         })
         .unwrap_or_default();
+    // The writer exports "Print" for an unclassified series (Komga rejects a null booktype) and
+    // marks it as a guess; reading it back would stamp that guess into bookType for good, since
+    // every source only fills a blank. Foreign files never carry the mark, so their value stands.
+    let booktype_guessed = v
+        .get("omnibus")
+        .and_then(|o| o.get("booktype_guessed"))
+        .and_then(|g| g.as_bool())
+        .unwrap_or(false);
     Some(SeriesJsonInfo {
         comicid,
         name: get_str("name"),
         publisher: get_str("publisher"),
         year,
         description: get_str("description_text"),
-        booktype: get_str("booktype"),
+        booktype: if booktype_guessed { None } else { get_str("booktype") },
         status,
         attached_volumes,
     })
@@ -3025,6 +3033,19 @@ mod tests {
         // Neither does a malformed block cost us the rest of the file.
         let junk = r#"{"version":"1.0.2","metadata":{"name":"Batman"},"omnibus":{"attached_volumes":"nope"}}"#;
         assert!(parse_series_json(junk).expect("parses").attached_volumes.is_empty());
+    }
+
+    #[test]
+    fn parse_series_json_skips_a_booktype_marked_as_our_guess() {
+        // Our writer's "Print" default for an unclassified series: never read back, or it would
+        // fill the blank bookType for good before a real source (Format tag, Metron) gets the chance.
+        let guessed = r#"{"version":"1.0.2","metadata":{"name":"Saga","booktype":"Print"},"omnibus":{"booktype_guessed":true}}"#;
+        assert!(parse_series_json(guessed).expect("parses").booktype.is_none());
+        // Our own file with a real bookType, and a foreign file (no mark), keep theirs.
+        let real = r#"{"version":"1.0.2","metadata":{"name":"Saga","booktype":"TPB"},"omnibus":{"attached_volumes":[]}}"#;
+        assert_eq!(parse_series_json(real).expect("parses").booktype.as_deref(), Some("TPB"));
+        let mylar = r#"{"version":"1.0.2","metadata":{"name":"Saga","booktype":"Print"}}"#;
+        assert_eq!(parse_series_json(mylar).expect("parses").booktype.as_deref(), Some("Print"));
     }
 
     #[test]
