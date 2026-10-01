@@ -808,8 +808,44 @@ fn issue_file_meta(info: Option<&ScanComicInfo>) -> IssueFileMeta {
     }
 }
 
-/// Folder-level identity evidence for the unmatched-retry sweep (matcher.rs): the first comic
-/// file's ComicInfo + the folder's series.json — the same precedence the scanner uses — with the
+/// The archive that speaks for a folder outside a full scan — the cover backfill's page and the
+/// unmatched sweep's identity evidence: the lowest natural-sorted archive that isn't an annual, by
+/// the same signals as `identity_info`. #237: the lowest file alone can be an annual — ComicVine
+/// names annual volumes without "The", so "Amazing Spider-Man Annual 001" sorts before "The Amazing
+/// Spider-Man 001" — and the series wore the annual's cover; an attached annual's ComicInfo names
+/// the ANNUAL volume, so the sweep could have matched the folder to it. A name that says "Annual" is
+/// skipped without opening the file; the rest are checked against their ComicInfo ('96-style
+/// one-offs). An all-annual folder falls back to its first file.
+fn folder_run_witness(folder: &Path) -> Option<(std::path::PathBuf, Option<ScanComicInfo>)> {
+    let files = crate::converter::comic_files_sorted(folder);
+    for path in &files {
+        let file_name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+        if annual_flag_for_signals(None, None, &file_name) {
+            continue;
+        }
+        let info = parse_comic_info(path);
+        let format = info.as_ref().and_then(|i| i.format.as_deref());
+        let number = info.as_ref().and_then(|i| i.number.as_deref());
+        if !annual_flag_for_signals(format, number, &file_name) {
+            return Some((path.clone(), info));
+        }
+    }
+    let first = files.into_iter().next()?;
+    let info = parse_comic_info(&first);
+    Some((first, info))
+}
+
+/// 5C's per-folder work: the folder's existing cover, else the first page of the archive that
+/// speaks for it, as the cover route URL the Series row stores.
+fn backfill_folder_cover(folder: &Path) -> Option<String> {
+    let (witness, _) = folder_run_witness(folder)?;
+    let cover = crate::converter::ensure_folder_cover(folder, &witness)?;
+    Some(format!("/api/library/cover?path={}", urlencoding::encode(&cover.to_string_lossy())))
+}
+
+/// Folder-level identity evidence for the unmatched-retry sweep (matcher.rs): the folder's first
+/// main-run file's ComicInfo (`folder_run_witness`, never an annual's) + the folder's series.json
+/// — the same precedence the scanner uses — with the
 /// live issue-id→volume resolution gated behind `allow_api` (budget-aware callers). Returns
 /// (metadataSource, metadataId, cv_id, metron_id) when the files identify the series.
 pub(crate) async fn folder_match_evidence(
@@ -820,8 +856,7 @@ pub(crate) async fn folder_match_evidence(
 ) -> Option<(String, String, Option<i32>, Option<i32>)> {
     let f = folder.to_path_buf();
     let (info, sj) = tokio::task::spawn_blocking(move || {
-        let first = crate::converter::first_comic_file(&f);
-        let info = first.as_ref().and_then(|p| parse_comic_info(p));
+        let info = folder_run_witness(&f).and_then(|(_, info)| info);
         let sj = read_series_json(&f);
         (info, sj)
     })
@@ -2447,7 +2482,8 @@ pub async fn scan_library(db: Db, library_path: String, library_id: String, spec
     // 5C. COVER BACKFILL → give cover-less series a real first-page cover
     // ---------------------------------------------------------
     // Unmatched / un-synced series never reach the provider sync's resolve_cover, so they'd otherwise
-    // show the placeholder. Pull the first page of their lowest archive into <folder>/cover.<ext>.
+    // show the placeholder. Pull the first page of their first main-run archive (never an annual's,
+    // #237 — see folder_run_witness) into <folder>/cover.<ext>.
     // Idempotent + cheap on re-scans: skips series that already have a coverUrl or a custom cover.
     let cover_source = sqlx::query_scalar::<_, String>(r#"SELECT value FROM "SystemSetting" WHERE key = 'cover_source'"#)
         .fetch_optional(&db.pool).await.ok().flatten().unwrap_or_else(|| "metadata".to_string());
@@ -2474,10 +2510,7 @@ pub async fn scan_library(db: Db, library_path: String, library_id: String, spec
                 cover_set.spawn(async move {
                     let _permit = sem.acquire_owned().await.ok();
                     tokio::task::spawn_blocking(move || {
-                        let folder_path = Path::new(&folder);
-                        let first = crate::converter::first_comic_file(folder_path)?;
-                        let cover = crate::converter::ensure_folder_cover(folder_path, &first)?;
-                        Some((id, format!("/api/library/cover?path={}", urlencoding::encode(&cover.to_string_lossy()))))
+                        backfill_folder_cover(Path::new(&folder)).map(|url| (id, url))
                     })
                     .await
                     .ok()
@@ -3020,6 +3053,88 @@ mod tests {
             identity_info(&only_annual, &only_annual_infos).and_then(|i| i.comic_vine_volume_id.as_deref()),
             Some("49197")
         );
+    }
+
+    /// A CBZ whose one page holds `page` (nothing on these paths decodes it) plus an optional ComicInfo.
+    fn write_test_cbz(path: &Path, page: &[u8], comic_info: Option<&str>) {
+        use std::io::Write as _;
+        let f = File::create(path).expect("create fixture cbz");
+        let mut zw = zip::ZipWriter::new(f);
+        if let Some(xml) = comic_info {
+            zw.start_file("ComicInfo.xml", zip::write::FileOptions::default()).unwrap();
+            zw.write_all(xml.as_bytes()).unwrap();
+        }
+        zw.start_file("01.jpg", zip::write::FileOptions::default()).unwrap();
+        zw.write_all(page).unwrap();
+        zw.finish().unwrap();
+    }
+
+    /// #237's folder: ComicVine names the annual volume without "The", so Mylar's annual file sorts
+    /// FIRST; a '96-style one-off (no Annual token in its name) sorts before the run's #1 too.
+    fn asm_folder_with_annuals_first() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("omnibus_run_witness_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create fixture folder");
+        write_test_cbz(&dir.join("Amazing Spider-Man Annual 001 (2026).cbz"), b"ANNUAL",
+            Some("<ComicInfo><Number>1</Number><Format>Annual</Format><ComicVineVolumeId>170303</ComicVineVolumeId></ComicInfo>"));
+        write_test_cbz(&dir.join("The Amazing Spider-Man '96 001 (1996).cbz"), b"ONEOFF",
+            Some("<ComicInfo><Number>1</Number><Format>Annual</Format><ComicVineVolumeId>60436</ComicVineVolumeId></ComicInfo>"));
+        write_test_cbz(&dir.join("The Amazing Spider-Man 001 (2025).cbz"), b"MAIN",
+            Some("<ComicInfo><Number>1</Number><ComicVineVolumeId>163325</ComicVineVolumeId></ComicInfo>"));
+        write_test_cbz(&dir.join("The Amazing Spider-Man 002 (2025).cbz"), b"MAIN2", None);
+        std::fs::write(dir.join("notes.txt"), b"not a comic").unwrap();
+        dir
+    }
+
+    #[test]
+    fn folder_run_witness_skips_annuals_by_name_and_by_comicinfo() {
+        let dir = asm_folder_with_annuals_first();
+        let (path, info) = folder_run_witness(&dir).expect("a witness");
+        assert_eq!(path.file_name().unwrap().to_string_lossy(), "The Amazing Spider-Man 001 (2025).cbz");
+        assert_eq!(info.and_then(|i| i.comic_vine_volume_id), Some("163325".to_string()));
+
+        // A folder of nothing but annuals has no run to prefer — it speaks for itself.
+        let only = std::env::temp_dir().join(format!("omnibus_run_witness_only_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&only).unwrap();
+        write_test_cbz(&only.join("Batman Annual 002 (2013).cbz"), b"A2", None);
+        write_test_cbz(&only.join("Batman Annual 001 (2012).cbz"), b"A1", None);
+        let (path, _) = folder_run_witness(&only).expect("a witness");
+        assert_eq!(path.file_name().unwrap().to_string_lossy(), "Batman Annual 001 (2012).cbz");
+
+        // No comics at all → no witness.
+        let empty = std::env::temp_dir().join(format!("omnibus_run_witness_empty_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&empty).unwrap();
+        std::fs::write(empty.join("cover.jpg"), b"x").unwrap();
+        assert!(folder_run_witness(&empty).is_none());
+
+        for d in [dir, only, empty] { let _ = std::fs::remove_dir_all(d); }
+    }
+
+    #[test]
+    fn cover_backfill_takes_the_runs_first_page_never_an_annuals() {
+        // #237: the series wore its annual's cover in the library grid.
+        let dir = asm_folder_with_annuals_first();
+        let url = backfill_folder_cover(&dir).expect("a cover");
+        assert_eq!(std::fs::read(dir.join("cover.jpg")).unwrap(), b"MAIN");
+        assert!(url.starts_with("/api/library/cover?path="), "{url}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn unmatched_sweep_evidence_never_comes_from_an_annual() {
+        // The annual's ComicInfo names the ANNUAL volume (that's how #203 restores the link), so
+        // reading the folder's identity from it would match "The Amazing Spider-Man (2025)" to
+        // "Amazing Spider-Man Annual". allow_api = false: the evidence is the files alone.
+        let dir = asm_folder_with_annuals_first();
+        let db_file = dir.join("sweep.db");
+        File::create(&db_file).expect("pre-create sqlite file");
+        let db_url = format!("file:{}", db_file.to_string_lossy().replace('\\', "/"));
+        let db = crate::db::Db::connect(&db_url, 1).await.expect("connect file-backed sqlite");
+
+        let got = folder_match_evidence(&db, &reqwest::Client::new(), &dir, false).await;
+        assert_eq!(got.map(|(source, id, _, _)| (source, id)), Some(("COMICVINE".to_string(), "163325".to_string())));
+
+        db.pool.close().await;
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ==== Discussion #182: local-first ingest — file-complete issues skip provider enrichment. ====

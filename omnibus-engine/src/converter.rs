@@ -1661,9 +1661,10 @@ pub fn ensure_folder_cover(folder: &Path, archive_path: &Path) -> Option<PathBuf
     }
 }
 
-/// The lowest natural-sorted comic archive directly inside `folder` (epub is skipped — its cover lives
-/// in OPF metadata, not as a page). Used to pick which file a series cover is pulled from.
-pub fn first_comic_file(folder: &Path) -> Option<PathBuf> {
+/// The comic archives directly inside `folder`, natural-sorted (epub is skipped — its cover lives in
+/// OPF metadata, not as a page). The scanner picks which of them speaks for the folder — its cover
+/// and its identity evidence — skipping annuals (scanner::folder_run_witness, #237).
+pub fn comic_files_sorted(folder: &Path) -> Vec<PathBuf> {
     let mut comics: Vec<PathBuf> = Vec::new();
     if let Ok(rd) = fs::read_dir(folder) {
         for entry in rd.flatten() {
@@ -1678,7 +1679,7 @@ pub fn first_comic_file(folder: &Path) -> Option<PathBuf> {
         }
     }
     comics.sort_by(|a, b| natural_cmp(&a.to_string_lossy(), &b.to_string_lossy()));
-    comics.into_iter().next()
+    comics
 }
 
 // ============================================================================
@@ -2726,15 +2727,16 @@ mod tests {
     }
 
     #[test]
-    fn first_comic_file_picks_lowest_and_ignores_noncomics() {
+    fn comic_files_sorted_orders_naturally_and_ignores_noncomics() {
         let dir = std::env::temp_dir().join(format!("omnibus_first_comic_{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("Series 010.cbz"), b"").unwrap();
         fs::write(dir.join("Series 002.cbz"), b"").unwrap();
         fs::write(dir.join("cover.jpg"), b"").unwrap(); // not a comic
         fs::write(dir.join("notes.txt"), b"").unwrap();
-        let got = first_comic_file(&dir).unwrap();
-        assert_eq!(got.file_name().unwrap().to_string_lossy(), "Series 002.cbz");
+        let got: Vec<String> = comic_files_sorted(&dir).iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().to_string()).collect();
+        assert_eq!(got, vec!["Series 002.cbz", "Series 010.cbz"]);
         let _ = fs::remove_dir_all(&dir);
     }
 }
