@@ -155,14 +155,6 @@ async fn stamp_credits_synced_in(tx: &mut sqlx::Transaction<'_, sqlx::Any>, db: 
     .map(|_| ())
 }
 
-/// ComicVine signals its velocity/burst block with HTTP 420 (not 429). Treating only 429 as a rate
-/// limit meant a 420 fell through to a JSON-parse error, was counted as a plain per-series failure,
-/// and the batch kept hammering the API instead of halting. The bail message keeps the "429" token
-/// the batch-halt check matches on.
-pub(crate) fn is_cv_rate_limited(status: reqwest::StatusCode) -> bool {
-    status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.as_u16() == 420
-}
-
 /// One ComicVine volume GET through the shared response cache — usage-logged, and 429-flagged,
 /// only on a real upstream call. `field_list` is part of the cache key, so asking for new fields
 /// is a fresh fetch rather than a stale hit.
@@ -181,9 +173,9 @@ async fn fetch_cv_volume(db: &Db, client: &Client, api_key: &str, metadata_id: &
         None => {
             let vol_resp = client.execute(vol_req).await?;
             crate::api_usage::log(&db.pool, "comicvine", &vol_url).await;
-            if is_cv_rate_limited(vol_resp.status()) {
+            if vol_resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
                 mark_flag(db, "cv_rate_limit_time").await;
-                anyhow::bail!("ComicVine rate limited (429/420) on volume fetch");
+                anyhow::bail!("ComicVine rate limited (429) on volume fetch");
             }
             let j: serde_json::Value = vol_resp.json().await?;
             crate::metadata_cache::put(db, "comicvine", &vol_full_url, &j).await;
@@ -661,7 +653,7 @@ async fn fetch_comicvine(
     if let Some(arr) = vol_data["concepts"].as_array() {
         for c in arr {
             if let Some(n) = c["name"].as_str() {
-                if is_real_genre(n) && !vol_genres.contains(&n.to_string()) {
+                if !n.is_empty() && !vol_genres.contains(&n.to_string()) {
                     vol_genres.push(n.to_string());
                 }
             }
@@ -819,9 +811,9 @@ async fn fetch_comicvine(
             None => {
                 let issue_resp = client.execute(issue_req).await?;
                 crate::api_usage::log(&db.pool, "comicvine", "https://comicvine.gamespot.com/api/issues/").await;
-                if is_cv_rate_limited(issue_resp.status()) {
+                if issue_resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
                     mark_flag(db, "cv_rate_limit_time").await;
-                    anyhow::bail!("ComicVine rate limited (429/420) on issues fetch");
+                    anyhow::bail!("ComicVine rate limited (429) on issues fetch");
                 }
                 let j: serde_json::Value = issue_resp.json().await?;
                 crate::metadata_cache::put(db, "comicvine", &issue_full_url, &j).await;
@@ -853,7 +845,7 @@ async fn fetch_comicvine(
         // annual's numbers belong to a DIFFERENT provider volume; without this, the parent volume's
         // "#1" data lands on "Annual #1" via the number-only heal.
         let existing_issues = sqlx::query(
-            r#"SELECT id, number, "metadataId", CAST("hasCustomMetadata" AS INTEGER) AS "hasCustomMetadata", name, "releaseDate", genres, description, CAST("hasCustomCover" AS INTEGER) AS "hasCustomCover", "coverUrl", "matchState", writers, artists, "coverArtists", colorists, letterers, characters, teams, locations FROM "Issue" WHERE "seriesId" = $1 AND "isAnnual" = false"#,
+            r#"SELECT id, number, "metadataId", CAST("hasCustomMetadata" AS INTEGER) AS "hasCustomMetadata", name, "releaseDate", genres, description, CAST("hasCustomCover" AS INTEGER) AS "hasCustomCover", "coverUrl", "matchState", writers, artists, "coverArtists", colorists, letterers, characters, teams, locations, "filePath" FROM "Issue" WHERE "seriesId" = $1 AND "isAnnual" = false"#,
         )
         .bind(series_id)
         .fetch_all(&db.pool)
@@ -945,6 +937,13 @@ async fn fetch_comicvine(
             let is_locked = target_row
                 .map(|r| r.try_get::<i64, _>("hasCustomMetadata").map(|v| v != 0).unwrap_or(false))
                 .unwrap_or(false);
+            // Review of #232: the release-date fill-only guard only makes sense for a row that HAS
+            // a file -- a WANTED placeholder with no file yet has no cover date to protect, and
+            // needs the provider's store date to keep moving as the real release date becomes
+            // known (a delayed issue shifting on the release calendar).
+            let has_file = target_row
+                .and_then(|r| r.try_get::<Option<String>, _>("filePath").unwrap_or(None))
+                .is_some_and(|p| !p.trim().is_empty());
             let reset_stale = heal_id && !is_locked;
             let (existing_name, existing_release, existing_genres, existing_desc, has_custom_cover, existing_cover) = if let Some(r) = target_row {
                 (
@@ -965,7 +964,7 @@ async fn fetch_comicvine(
             // file_metadata_priority: a release date already on the row (read from ComicInfo.xml at scan)
             // is kept; the provider only fills a blank. ComicVine's store date otherwise silently
             // replaces the file's cover date, shifting Month/Day (and Year across a year boundary).
-            let release_val = prefer_existing(existing_release, issue_date.clone(), is_locked, file_priority);
+            let release_val = prefer_existing(existing_release, issue_date.clone(), is_locked, file_priority && has_file);
             // A locked (manually edited) issue keeps its description; file-priority keeps a non-empty
             // ComicInfo-derived one; otherwise take the provider's.
             let desc_val = prefer_existing(existing_desc, cv_desc.clone(), is_locked, file_priority);
@@ -1342,7 +1341,7 @@ async fn fetch_metron(
     // #203: annual rows are EXCLUDED outright — their numbers belong to a different provider
     // volume, and the number-only heal would otherwise stamp the parent volume's data onto them.
     let existing_issues = sqlx::query(
-        r#"SELECT id, number, "metadataId", CAST("hasCustomMetadata" AS INTEGER) AS "hasCustomMetadata", name, "releaseDate", CAST("hasCustomCover" AS INTEGER) AS "hasCustomCover", "coverUrl", "matchState", genres FROM "Issue" WHERE "seriesId" = $1 AND "isAnnual" = false"#,
+        r#"SELECT id, number, "metadataId", CAST("hasCustomMetadata" AS INTEGER) AS "hasCustomMetadata", name, "releaseDate", CAST("hasCustomCover" AS INTEGER) AS "hasCustomCover", "coverUrl", "matchState", genres, "filePath" FROM "Issue" WHERE "seriesId" = $1 AND "isAnnual" = false"#,
     )
     .bind(series_id)
     .fetch_all(&db.pool)
@@ -1444,6 +1443,9 @@ async fn fetch_metron(
             (None, None, false, None)
         };
 
+        let has_file = target_row
+            .and_then(|r| r.try_get::<Option<String>, _>("filePath").unwrap_or(None))
+            .is_some_and(|p| !p.trim().is_empty());
         let metron_existing_state: Option<String> = if reset_stale { None } else {
             target_row.and_then(|r| r.try_get::<Option<String>, _>("matchState").unwrap_or(None))
         };
@@ -1467,7 +1469,7 @@ async fn fetch_metron(
         // resolver lets them fill blanks but never clobber a real story title that the detail
         // pass (or a ComicInfo read) already landed. Lock + file priority unchanged.
         let name_val: Option<String> = resolve_synced_name(existing_name, Some(issue_name), &issue_num, is_locked, file_priority);
-        let release_val: Option<String> = prefer_existing(existing_release, issue_date.clone(), is_locked, file_priority);
+        let release_val: Option<String> = prefer_existing(existing_release, issue_date.clone(), is_locked, file_priority && has_file);
         // A custom issue cover (set in the Smart Matcher) survives every sync; else the provider's wins.
         let cover_val: Option<String> = if has_custom_cover { existing_cover } else { issue_cover.clone() };
 
@@ -1954,19 +1956,6 @@ pub(crate) fn is_cv_rate_limited(status: reqwest::StatusCode) -> bool {
 /// MATCHED as before (issue #179).
 pub(crate) fn next_match_state(existing: Option<String>) -> &'static str {
     if existing.as_deref() == Some("DEEP_SYNCED") { "DEEP_SYNCED" } else { "MATCHED" }
-}
-
-/// ComicVine "concepts" are a free-form tag cloud ("Variant Cover: Action Figure", "Homage Covers",
-/// event and character-trait tags), not genres. Only a concept that is a recognised genre name is
-/// promoted to Series/Issue genres; everything else would pollute <Genre> in every embedded file.
-pub(crate) fn is_real_genre(name: &str) -> bool {
-    const GENRES: &[&str] = &[
-        "action", "adventure", "alternate history", "anthology", "biography", "comedy", "crime",
-        "cyberpunk", "drama", "espionage", "fantasy", "historical", "horror", "humor", "mystery",
-        "noir", "post-apocalyptic", "romance", "satire", "science fiction", "slice of life",
-        "sports", "superhero", "supernatural", "survival", "thriller", "war", "western", "zombies",
-    ];
-    GENRES.contains(&name.trim().to_ascii_lowercase().as_str())
 }
 
 /// Column-write policy for provider credit syncs (issue #179): a locked (hasCustomMetadata) issue
@@ -2647,22 +2636,6 @@ mod tests {
         assert_eq!(next_match_state(Some("MATCHED".to_string())), "MATCHED");
         assert_eq!(next_match_state(Some("UNMATCHED".to_string())), "MATCHED");
         assert_eq!(next_match_state(None), "MATCHED");
-    }
-
-    #[test]
-    fn cv_velocity_block_420_counts_as_rate_limited() {
-        assert!(is_cv_rate_limited(reqwest::StatusCode::from_u16(420).unwrap()));
-        assert!(is_cv_rate_limited(reqwest::StatusCode::TOO_MANY_REQUESTS));
-        assert!(!is_cv_rate_limited(reqwest::StatusCode::OK));
-    }
-
-    #[test]
-    fn is_real_genre_rejects_cv_concept_noise() {
-        assert!(is_real_genre("Superhero"));
-        assert!(is_real_genre(" science fiction "));
-        assert!(!is_real_genre("Variant Cover: Action Figure"));
-        assert!(!is_real_genre("Homage Covers"));
-        assert!(!is_real_genre(""));
     }
 
     #[test]
