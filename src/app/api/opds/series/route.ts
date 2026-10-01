@@ -7,6 +7,8 @@ import { escapeXml } from '@/lib/utils/xml';
 import { getAccessibleLibraryIds, seriesAccessWhere } from '@/lib/library-access';
 import { getPublicBaseUrl } from '@/lib/opds-base-url';
 import { opdsCoverLinks } from '@/lib/opds-covers';
+import { authorElements, entryUpdated, feedContentType, feedUpdated, publisherElement } from '@/lib/opds-feed';
+import { seriesAuthors } from '@/lib/komga/dto';
 
 export const dynamic = 'force-dynamic';
 
@@ -49,19 +51,21 @@ export async function GET(req: Request) {
   <entry>
     <title>${escapeXml(s.name)}</title>
     <id>urn:omnibus:series:${s.id}</id>
-    <updated>${new Date().toISOString()}</updated>
-    <author><name>${escapeXml(s.publisher || 'Unknown')}</name></author>
+    <updated>${entryUpdated(s.updatedAt)}</updated>
+    ${authorElements(seriesAuthors(s))}
+    ${publisherElement(s.publisher)}
     <content type="text">${escapeXml(s.description || 'No description available.')}</content>
     ${coverLinks}
-    <link rel="subsection" href="${baseUrl}/api/opds/series/${s.id}" type="application/atom+xml;profile=opds-catalog;kind=navigation"/>
+    <link rel="subsection" href="${baseUrl}/api/opds/series/${s.id}" type="application/atom+xml;profile=opds-catalog;kind=acquisition"/>
   </entry>`;
     }).join('');
 
     const xml = `<?xml version="1.0" encoding="UTF-8"?>
-<feed xmlns="http://www.w3.org/2005/Atom" xmlns:opds="http://opds-spec.org/2010/catalog">
+<feed xmlns="http://www.w3.org/2005/Atom" xmlns:opds="http://opds-spec.org/2010/catalog" xmlns:dc="http://purl.org/dc/elements/1.1/">
   <id>urn:omnibus:series</id>
   <title>All Series</title>
-  <updated>${new Date().toISOString()}</updated>
+  <updated>${feedUpdated(items.map(s => s.updatedAt))}</updated>
+  <author><name>Omnibus</name></author>
   <link rel="self" href="${baseUrl}/api/opds/series?page=${page}" type="application/atom+xml;profile=opds-catalog;kind=navigation"/>
   <link rel="start" href="${baseUrl}/api/opds" type="application/atom+xml;profile=opds-catalog;kind=navigation"/>
   <link rel="up" href="${baseUrl}/api/opds" type="application/atom+xml;profile=opds-catalog;kind=navigation"/>
@@ -70,7 +74,7 @@ export async function GET(req: Request) {
   ${entries}
 </feed>`;
 
-    return new Response(xml, { headers: { 'Content-Type': 'application/atom+xml;profile=opds-catalog; charset=utf-8' } });
+    return new Response(xml, { headers: { 'Content-Type': feedContentType('navigation') } });
     } catch (error: unknown) {
         Logger.log(`[OPDS Series API] Error: ${getErrorMessage(error)}`, 'error');
         return new Response('Internal Server Error', { status: 500 });
