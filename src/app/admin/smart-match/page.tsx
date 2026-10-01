@@ -449,6 +449,16 @@ export default function SmartMatchPage() {
                 if (res.status === 429) {
                     throw new Error("FATAL_RATE_LIMIT");
                 }
+                // FIX (review of #231): a non-OK response (e.g. a 500 from the search route) used to
+                // fall straight into `data.results || []` below -- an empty list, same as a genuine
+                // no-match -- and get recorded as NOT_FOUND. A transient server hiccup then looked
+                // exactly like "nothing on the provider", and NOT_FOUND isn't retried (the provider
+                // genuinely has nothing new to say), so the series was stuck until a manual re-scan.
+                // Routing it through the catch block below records ERROR instead, which the retry-gap
+                // fix above DOES revisit on the next scan.
+                if (!res.ok) {
+                    throw new Error(`Search request failed with status ${res.status}`);
+                }
 
                 const data = await res.json();
 
