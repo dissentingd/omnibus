@@ -130,3 +130,112 @@ describe('API Route: OPDS Series Feed (/api/opds/series/[id])', () => {
         expect(posRun2).toBeLessThan(posAnnual);
     });
 });
+
+// #218: entry metadata — creators as separate <author> elements, the publisher in <dc:publisher>,
+// <updated> from the rows, and a response Content-Type that carries the OPDS kind. #221 point 4: every
+// publication entry carries an acquisition link whatever the caller's permissions, typed with the
+// file's real media type.
+describe('API Route: OPDS Series Feed — entry conformance', () => {
+    const ISSUE_UPDATED = new Date('2026-09-20T10:00:00.000Z');
+    const LATER_UPDATED = new Date('2026-09-22T00:00:00.000Z');
+    const SERIES_UPDATED = new Date('2026-09-25T08:30:00.000Z');
+
+    const issue = (overrides: Record<string, unknown> = {}) => ({
+        id: 'iss_1', number: '1', name: null, filePath: '/comics/batman 01.cbz',
+        pageCount: 22, coverUrl: null, description: null, updatedAt: ISSUE_UPDATED, ...overrides,
+    });
+
+    const series = (overrides: Record<string, unknown> = {}) => ({
+        id: 'ser_1', name: 'Batman', publisher: 'DC Comics',
+        folderPath: '/comics/DC Comics/Batman (2016)', libraryId: 'lib_1',
+        updatedAt: SERIES_UPDATED, writers: '["Tom King"]', artists: '["Mikel Janín"]',
+        issues: [], ...overrides,
+    });
+
+    const feedFor = async (user: Record<string, unknown>, overrides: Record<string, unknown>) => {
+        mocks.validateApiKey.mockResolvedValue({ valid: true, user });
+        mocks.findUniqueSeries.mockResolvedValue(series(overrides));
+        const res = await GET(createReq(), { params: createParams() }) as Response;
+        return { res, xml: await res.text() };
+    };
+
+    it('writes each creator as its own <author> and the publisher as <dc:publisher>', async () => {
+        const { xml } = await feedFor({ id: 'u1', role: 'USER', canDownload: true }, {
+            issues: [issue({ writers: '["Scott Snyder"]', artists: '["Greg Capullo"]' })],
+        });
+
+        expect(xml).toContain('<author><name>Scott Snyder</name></author>');
+        expect(xml).toContain('<author><name>Greg Capullo</name></author>');
+        expect(xml).toContain('<dc:publisher>DC Comics</dc:publisher>');
+        // The publisher is no longer published as the author (#218).
+        expect(xml).not.toContain('<author><name>DC Comics</name></author>');
+    });
+
+    it('falls back per field to the series creators, and emits no <author> when neither has one', async () => {
+        const fallback = await feedFor({ id: 'u1', role: 'ADMIN' }, {
+            issues: [issue({ writers: null, artists: null })],
+        });
+        expect(fallback.xml).toContain('<author><name>Tom King</name></author>');
+        expect(fallback.xml).toContain('<author><name>Mikel Janín</name></author>');
+
+        const bare = await feedFor({ id: 'u1', role: 'ADMIN' }, {
+            writers: null, artists: null, issues: [issue()],
+        });
+        // No entry-level <author> — only the feed's own, which keeps the document valid Atom.
+        const entry = bare.xml.slice(bare.xml.indexOf('<entry>'), bare.xml.indexOf('</entry>'));
+        expect(entry).not.toContain('<author>');
+        expect(bare.xml).toContain('<author><name>Omnibus</name></author>');
+    });
+
+    it('titles an issue "Series #N - Title", reducing to "Series #N" when the title adds nothing', async () => {
+        const { xml } = await feedFor({ id: 'u1', role: 'ADMIN' }, {
+            issues: [
+                issue({ id: 'iss_1', number: '1', name: 'I Am Gotham' }),
+                issue({ id: 'iss_2', number: '2', name: 'Batman #2' }),
+                issue({ id: 'iss_3', number: '3', name: 'Batman' }),
+                issue({ id: 'iss_4', number: '4', name: null }),
+            ],
+        });
+
+        expect(xml).toContain('<title>Batman #1 - I Am Gotham</title>');
+        expect(xml).toContain('<title>Batman #2</title>');
+        expect(xml).toContain('<title>Batman #3</title>');
+        expect(xml).toContain('<title>Batman #4</title>');
+    });
+
+    it('stamps each entry from its updatedAt and the feed from its newest entry', async () => {
+        const { xml } = await feedFor({ id: 'u1', role: 'ADMIN' }, {
+            issues: [issue({ id: 'iss_1', updatedAt: ISSUE_UPDATED }), issue({ id: 'iss_2', number: '2', updatedAt: LATER_UPDATED })],
+        });
+
+        expect(xml).toContain(`<updated>${ISSUE_UPDATED.toISOString()}</updated>`);
+        const feedHead = xml.slice(xml.indexOf('<feed'), xml.indexOf('<entry'));
+        expect(feedHead).toContain(`<updated>${LATER_UPDATED.toISOString()}</updated>`);
+        expect(feedHead).not.toContain('<updated>1970');
+    });
+
+    it('is an acquisition feed: the kind is on the response and on the links that point at it', async () => {
+        const { res, xml } = await feedFor({ id: 'u1', role: 'ADMIN' }, {});
+
+        expect(res.headers.get('Content-Type'))
+            .toBe('application/atom+xml;profile=opds-catalog;kind=acquisition; charset=utf-8');
+        expect(xml).toMatch(/<link rel="self" href="[^"]*\/api\/opds\/series\/ser_1" type="application\/atom\+xml;profile=opds-catalog;kind=acquisition"\/>/);
+    });
+
+    it('gives every issue an acquisition link typed with the file\'s real media type, whatever the permissions', async () => {
+        const { xml } = await feedFor({ id: 'u1', role: 'USER', canDownload: false }, {
+            issues: [issue({ id: 'iss_1', filePath: '/comics/batman 01.cbz' }), issue({ id: 'iss_2', number: '2', filePath: '/comics/batman 02.cbr' })],
+        });
+
+        // #221 point 4: §5.4 wants an acquisition link on every entry; the download route is where a
+        // user without the permission is refused (403), not the feed.
+        expect(xml).toMatch(/<link rel="http:\/\/opds-spec\.org\/acquisition" href="[^"]*\/api\/opds\/download\?issueId=iss_1" type="application\/vnd\.comicbook\+zip"\/>/);
+        expect(xml).toMatch(/<link rel="http:\/\/opds-spec\.org\/acquisition" href="[^"]*\/api\/opds\/download\?issueId=iss_2" type="application\/vnd\.comicbook-rar"\/>/);
+    });
+
+    it('declares the page-stream link as the WebP the page route actually serves', async () => {
+        const { xml } = await feedFor({ id: 'u1', role: 'ADMIN' }, { issues: [issue()] });
+
+        expect(xml).toContain('rel="http://vaemendis.net/opds-pse/stream" type="image/webp"');
+    });
+});
