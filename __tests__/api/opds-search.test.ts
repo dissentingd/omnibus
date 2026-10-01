@@ -12,11 +12,16 @@ const mocks = vi.hoisted(() => ({
     validateApiKey: vi.fn(),
     seriesFindMany: vi.fn(),
     issueFindMany: vi.fn(),
+    readProgress: vi.fn(),
 }));
 
 vi.mock('@/lib/api-auth', () => ({ validateApiKey: mocks.validateApiKey }));
 vi.mock('@/lib/db', () => ({
-    prisma: { series: { findMany: mocks.seriesFindMany }, issue: { findMany: mocks.issueFindMany } },
+    prisma: {
+        series: { findMany: mocks.seriesFindMany },
+        issue: { findMany: mocks.issueFindMany },
+        readProgress: { findMany: mocks.readProgress },
+    },
 }));
 vi.mock('@/lib/library-access', () => ({
     getAccessibleLibraryIds: vi.fn(async () => ['lib_1']),
@@ -28,9 +33,18 @@ const searchReq = (q: string) => new Request(`http://localhost/api/opds/search?q
 const whereOf = (mock: { mock: { calls: unknown[][] } }) =>
     JSON.stringify((mock.mock.calls[0]?.[0] as { where?: unknown })?.where ?? '');
 
+const issueRow = (overrides: Record<string, unknown> = {}) => ({
+    id: 'iss_1', seriesId: 'ser_1', number: '1', name: 'Chapter One', isAnnual: false, description: null,
+    filePath: '/comics/Saga/Saga 001.cbz', pageCount: 22, writers: null, artists: null,
+    releaseDate: null, updatedAt: new Date('2026-09-02T00:00:00Z'),
+    series: { id: 'ser_1', name: 'Saga', publisher: 'Image', writers: '["Brian K. Vaughan"]', artists: null },
+    ...overrides,
+});
+
 describe('GET /api/opds/search', () => {
     beforeEach(() => {
         mocks.validateApiKey.mockResolvedValue({ valid: true, user: { id: 'u1', role: 'USER' }, keyType: 'OPDS_KEY' });
+        mocks.readProgress.mockResolvedValue([]);
     });
 
     it('challenges a client without a valid OPDS key', async () => {
@@ -50,14 +64,7 @@ describe('GET /api/opds/search', () => {
                 coverUrl: null, writers: '["Brian K. Vaughan"]', artists: null, updatedAt: new Date('2026-09-01T00:00:00Z'),
             },
         ]);
-        mocks.issueFindMany.mockResolvedValue([
-            {
-                id: 'iss_1', number: '1', name: 'Chapter One', isAnnual: false, description: null,
-                filePath: '/comics/Saga/Saga 001.cbz', pageCount: 22, writers: null, artists: null,
-                updatedAt: new Date('2026-09-02T00:00:00Z'),
-                series: { id: 'ser_1', name: 'Saga', publisher: 'Image', writers: '["Brian K. Vaughan"]', artists: null },
-            },
-        ]);
+        mocks.issueFindMany.mockResolvedValue([issueRow()]);
 
         const res = await search(searchReq('saga'));
         const xml = await res.text();
@@ -84,6 +91,40 @@ describe('GET /api/opds/search', () => {
         expect(whereOf(mocks.issueFindMany)).toContain('lib_1');
         // The term is ANDed with the grants, never instead of them.
         expect(whereOf(mocks.seriesFindMany)).toContain('saga');
+    });
+
+    // `number` is a string column, so the query's own order puts #10 before #2. The feed is a reading
+    // list: it goes back through the series' comparator (the run by number, annuals after it).
+    it('orders matched issues in reading order, not by the number string', async () => {
+        mocks.seriesFindMany.mockResolvedValue([]);
+        mocks.issueFindMany.mockResolvedValue([
+            issueRow({ id: 'iss_10', number: '10', name: null }),
+            issueRow({ id: 'iss_2', number: '2', name: null }),
+            issueRow({ id: 'iss_annual', number: '1', name: null, isAnnual: true }),
+        ]);
+
+        const xml = await (await search(searchReq('saga'))).text();
+
+        const at = (title: string) => xml.indexOf(`<title>${title}</title>`);
+        expect(at('Saga #2')).toBeGreaterThan(-1);
+        expect(at('Saga #2')).toBeLessThan(at('Saga #10'));
+        expect(at('Saga #10')).toBeLessThan(at('Saga Annual #1'));
+    });
+
+    it('carries the caller\'s own position in a matched issue, like the other issue feeds', async () => {
+        mocks.seriesFindMany.mockResolvedValue([]);
+        mocks.issueFindMany.mockResolvedValue([issueRow()]);
+        mocks.readProgress.mockResolvedValue([
+            { issueId: 'iss_1', currentPage: 6, isCompleted: false, updatedAt: new Date('2026-09-27T21:10:00.000Z') },
+        ]);
+
+        const xml = await (await search(searchReq('saga'))).text();
+
+        expect(mocks.readProgress).toHaveBeenCalledWith({
+            where: { userId: 'u1', issueId: { in: ['iss_1'] } },
+            select: { issueId: true, currentPage: true, isCompleted: true, updatedAt: true },
+        });
+        expect(xml).toContain('pse:lastRead="7" pse:lastReadDate="2026-09-27T21:10:00.000Z"');
     });
 
     it('answers an empty feed (not an error) when no terms are given', async () => {

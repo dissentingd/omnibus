@@ -4,7 +4,7 @@
 // built from a row's creators, the issue entry title, the entry builders themselves, and the feed
 // envelope. Kept in one module so the rules live in a single place and the feeds cannot drift apart.
 import { escapeXml } from '@/lib/utils/xml';
-import { authorsFromRows, seriesAuthors, type KomgaAuthor } from '@/lib/komga/dto';
+import { authorsFromRows, parseJsonList, seriesAuthors, type KomgaAuthor } from '@/lib/komga/dto';
 import { opdsCoverLinks } from '@/lib/opds-covers';
 import { mediaTypeForFile } from '@/lib/file-download';
 
@@ -53,15 +53,23 @@ export function publisherElement(publisher: string | null | undefined): string {
 
 /**
  * An issue's creators: its own `writers`/`artists`, falling back per field to the series' (#218).
+ * "Absent" means the column parses to no names, not just that it is null: a credit refresh that
+ * finds nothing writes `JSON.stringify([])`, and with `??` alone such an entry carried no `<author>`
+ * even when the series has writers.
  */
 export function issueCreators(
     issue: { writers?: string | null; artists?: string | null },
     series: { writers?: string | null; artists?: string | null },
 ): KomgaAuthor[] {
     return authorsFromRows([{
-        writers: issue.writers ?? series.writers,
-        artists: issue.artists ?? series.artists,
+        writers: creditsOrSeries(issue.writers, series.writers),
+        artists: creditsOrSeries(issue.artists, series.artists),
     }]);
+}
+
+/** The issue's own credit column when it holds at least one name, the series' column otherwise. */
+function creditsOrSeries(own: string | null | undefined, seriesColumn: string | null | undefined): string | null | undefined {
+    return parseJsonList(own).length > 0 ? own : seriesColumn;
 }
 
 /**
@@ -113,6 +121,11 @@ export interface IssueFeedRow {
 export interface IssueProgress {
     /** 0-based index, as the app's own reader stores it. */
     currentPage: number;
+    /**
+     * A finished issue stores the page count itself as its position (KOReader's finished sync and the
+     * Komga mark-read both write it that way), which as a 1-based page would sit one past the end.
+     */
+    isCompleted?: boolean;
     updatedAt: Date | string;
 }
 
@@ -138,10 +151,24 @@ export function seriesEntry(baseUrl: string, series: SeriesFeedRow): string {
 }
 
 /**
+ * `pse:lastRead` / `pse:lastReadDate` — the 1-based page OPDS-PSE expects, from the stored 0-based
+ * `currentPage`. A finished issue reports the last page rather than `currentPage + 1`: its stored
+ * position is the page count itself (KOReader's finished sync and the Komga mark-read both write it
+ * that way), which would otherwise read as one page past the end. Nothing is emitted for an issue the
+ * caller has not started, and the page is clamped so a stale position can never exceed the count.
+ */
+function lastReadAttributes(progress: IssueProgress | null | undefined, pageCount: number): string {
+    if (!progress || pageCount <= 0) return '';
+    if (!progress.isCompleted && progress.currentPage <= 0) return '';
+    const page = progress.isCompleted ? pageCount : Math.min(progress.currentPage + 1, pageCount);
+    const date = toIso(progress.updatedAt);
+    return date ? ` pse:lastRead="${page}" pse:lastReadDate="${date}"` : '';
+}
+
+/**
  * An issue as an acquisition entry. `pageCount` is the caller's resolved count (the series feed
- * self-heals a stored 0 first), and `progress` adds `pse:lastRead` / `pse:lastReadDate` so a
- * page-streaming client resumes where the reader stopped — expressed as the 1-based page number
- * OPDS-PSE clients expect (the stored `currentPage` is the app's own 0-based index).
+ * self-heals a stored 0 first) and `progress` adds the reading position, so a page-streaming client
+ * resumes where the reader stopped.
  */
 export function issueEntry(
     baseUrl: string,
@@ -149,13 +176,11 @@ export function issueEntry(
     issue: IssueFeedRow,
     options: { pageCount: number; progress?: IssueProgress | null },
 ): string {
-    const read = options.progress && options.progress.currentPage > 0 ? options.progress : null;
-    const readDate = read ? toIso(read.updatedAt) : null;
-    const lastRead = read && readDate
-        ? ` pse:lastRead="${read.currentPage + 1}" pse:lastReadDate="${readDate}"`
+    // An uncounted issue (`pageCount` 0; only the series feed heals one) advertises no page stream at
+    // all: `pse:count="0"` is a stream a client cannot render. The acquisition link still stands.
+    const pseLink = options.pageCount > 0
+        ? `<link rel="http://vaemendis.net/opds-pse/stream" type="image/webp" href="${baseUrl}/api/opds/page/${issue.id}/{pageNumber}" pse:count="${options.pageCount}"${lastReadAttributes(options.progress, options.pageCount)}/>`
         : '';
-
-    const pseLink = `<link rel="http://vaemendis.net/opds-pse/stream" type="image/webp" href="${baseUrl}/api/opds/page/${issue.id}/{pageNumber}" pse:count="${options.pageCount}"${lastRead}/>`;
 
     // Every publication entry carries its acquisition link, whatever the caller's permissions
     // (#221 point 4): §5.4 asks for one on every entry, the download route already answers 403 to a

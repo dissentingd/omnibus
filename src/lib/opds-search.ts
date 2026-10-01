@@ -8,6 +8,7 @@
 import { prisma } from '@/lib/db';
 import type { Prisma } from '@prisma/client';
 import { ciContains } from '@/lib/utils/db-search';
+import { orderBooks, type KomgaIssueRow } from '@/lib/komga/dto';
 import { nestedSeriesAccessWhere, seriesAccessWhere, type AccessibleLibraries } from '@/lib/library-access';
 
 /** Series are listed first, then issues; each is capped at the feeds' page size. */
@@ -36,7 +37,27 @@ export async function searchIssueRows(libs: AccessibleLibraries, terms: string) 
             ],
         },
         include: { series: { select: { id: true, name: true, publisher: true, writers: true, artists: true } } },
+        // Series first, then this query's own `number` (a string column: it decides which rows come
+        // back, and `issuesInReadingOrder` puts them in reading order once they are here).
         orderBy: [{ seriesId: 'asc' }, { number: 'asc' }, { id: 'asc' }],
         take: OPDS_SEARCH_LIMIT,
     });
+}
+
+/**
+ * The matched issues in reading order: the series' own order — the run by number with the annuals
+ * after it (`orderBooks`, the series page's comparator), not `#10` before `#2` as the string column
+ * sorts. Groups keep the query's series order, and the query's `id` tiebreak survives because
+ * `Array.prototype.sort` is stable.
+ */
+export function issuesInReadingOrder<T extends Pick<KomgaIssueRow, 'number' | 'isAnnual' | 'releaseDate'> & { seriesId: string }>(
+    rows: readonly T[],
+): T[] {
+    const bySeries = new Map<string, T[]>();
+    for (const row of rows) {
+        const group = bySeries.get(row.seriesId);
+        if (group) group.push(row);
+        else bySeries.set(row.seriesId, [row]);
+    }
+    return [...bySeries.values()].flatMap((group) => orderBooks(group).map((ordered) => ordered.issue));
 }

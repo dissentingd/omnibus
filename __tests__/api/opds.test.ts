@@ -112,4 +112,22 @@ describe('API Route: OPDS Root Catalog', () => {
         expect(many).toContain('<title>Libraries</title>');
         expect(many).toMatch(/href="[^"]*\/api\/opds\/sections\/libraries"/);
     });
+
+    // Continue Reading, Recently Added and On Deck lead to acquisition feeds — their entries are
+    // publications — so their subsection link has to say `kind=acquisition`; Libraries leads to
+    // another navigation feed and All Series stays navigation.
+    it('declares each entry\'s own kind on its subsection link', async () => {
+        vi.mocked(apiAuth.validateApiKey).mockResolvedValue(authorized);
+        mocks.libraryCount.mockResolvedValue(3);
+
+        const xml = await (await GET(new Request('http://localhost/api/opds')) as Response).text();
+        const kindOf = (path: string) =>
+            xml.match(new RegExp(`href="[^"]*/api/opds/${path}" type="([^"]+)"`))?.[1];
+
+        expect(kindOf('sections/continue')).toBe('application/atom+xml;profile=opds-catalog;kind=acquisition');
+        expect(kindOf('sections/recent')).toBe('application/atom+xml;profile=opds-catalog;kind=acquisition');
+        expect(kindOf('sections/ondeck')).toBe('application/atom+xml;profile=opds-catalog;kind=acquisition');
+        expect(kindOf('sections/libraries')).toBe('application/atom+xml;profile=opds-catalog;kind=navigation');
+        expect(kindOf('series')).toBe('application/atom+xml;profile=opds-catalog;kind=navigation');
+    });
 });

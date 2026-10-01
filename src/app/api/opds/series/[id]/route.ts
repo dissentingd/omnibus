@@ -7,6 +7,7 @@ import { getAccessibleLibraryIds, canAccessLibraryId } from '@/lib/library-acces
 import { countArchivePages, isPageCountable, countArchivePagesViaEngine, isEngineCountable } from '@/lib/utils/archive-pages';
 import { getPublicBaseUrl } from '@/lib/opds-base-url';
 import { atomFeed, feedContentType, feedUpdated, issueEntry } from '@/lib/opds-feed';
+import { progressByIssueId } from '@/lib/opds-progress';
 
 export const dynamic = 'force-dynamic';
 
@@ -49,13 +50,9 @@ export async function GET(req: Request, { params }: { params: Promise<{ id: stri
         return numA - numB;
     });
 
-    // #221 point 3: pse:lastRead / pse:lastReadDate, so a page-streaming client resumes where this
-    // user stopped. One query for the whole feed rather than one per issue.
-    const progressRows = await prisma.readProgress.findMany({
-        where: { userId: auth.user.id, issueId: { in: sortedIssues.map(i => i.id) } },
-        select: { issueId: true, currentPage: true, updatedAt: true },
-    });
-    const progressByIssueId = new Map(progressRows.map(p => [p.issueId, p]));
+    // #221: pse:lastRead / pse:lastReadDate, so a page-streaming client resumes where this user
+    // stopped — one query for the whole feed rather than one per issue.
+    const progress = await progressByIssueId(auth.user.id, sortedIssues.map((i) => i.id));
 
     const entries = [];
     for (const issue of sortedIssues) {
@@ -77,7 +74,7 @@ export async function GET(req: Request, { params }: { params: Promise<{ id: stri
 
         entries.push(issueEntry(baseUrl, series, issue, {
             pageCount,
-            progress: progressByIssueId.get(issue.id) ?? null,
+            progress: progress.get(issue.id) ?? null,
         }));
     }
 

@@ -3,7 +3,7 @@ import { prisma } from '@/lib/db';
 import { validateApiKey } from '@/lib/api-auth';
 import { getErrorMessage } from '@/lib/utils/error';
 import { Logger } from '@/lib/logger';
-import { getAccessibleLibraryIds, seriesAccessWhere } from '@/lib/library-access';
+import { getAccessibleLibraryIds, canAccessLibraryId, seriesAccessWhere } from '@/lib/library-access';
 import { getPublicBaseUrl } from '@/lib/opds-base-url';
 import { escapeXml } from '@/lib/utils/xml';
 import { atomFeed, feedContentType, feedUpdated, seriesEntry } from '@/lib/opds-feed';
@@ -28,6 +28,12 @@ export async function GET(req: Request) {
     // ANDed inside the grants, so it can only ever narrow what the caller may already see.
     const accessibleLibs = await getAccessibleLibraryIds(auth.user?.id, auth.user?.role);
     const libraryId = url.searchParams.get('library');
+    // A single library's list is titled with the library's own name (#221): "All Series" is what the
+    // whole catalog says. The name is only read for a library the caller may already see — the id
+    // comes from the request, and an inaccessible one must not leak its name back.
+    const library = libraryId && canAccessLibraryId(accessibleLibs, libraryId)
+        ? await prisma.library.findUnique({ where: { id: libraryId }, select: { name: true } })
+        : null;
     const seriesList = await prisma.series.findMany({
         where: libraryId
             ? { AND: [seriesAccessWhere(accessibleLibs), { libraryId }] }
@@ -61,7 +67,7 @@ export async function GET(req: Request) {
     const xml = atomFeed({
         // A single library's list is its own feed, not page 1 of the whole catalog.
         id: libraryId ? `urn:omnibus:series:library:${escapeXml(libraryId)}` : 'urn:omnibus:series',
-        title: 'All Series',
+        title: library?.name ?? 'All Series',
         updated: feedUpdated(items.map(s => s.updatedAt)),
         links,
         entries,

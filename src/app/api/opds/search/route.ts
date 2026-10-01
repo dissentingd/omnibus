@@ -8,7 +8,8 @@ import { Logger } from '@/lib/logger';
 import { getAccessibleLibraryIds } from '@/lib/library-access';
 import { getPublicBaseUrl } from '@/lib/opds-base-url';
 import { atomFeed, feedContentType, feedUpdated, issueEntry, searchLink, seriesEntry } from '@/lib/opds-feed';
-import { searchIssueRows, searchSeriesRows } from '@/lib/opds-search';
+import { searchIssueRows, searchSeriesRows, issuesInReadingOrder } from '@/lib/opds-search';
+import { progressByIssueId } from '@/lib/opds-progress';
 
 export const dynamic = 'force-dynamic';
 
@@ -31,12 +32,21 @@ export async function GET(req: Request) {
         // has typed anything.
         if (terms) {
             const libs = await getAccessibleLibraryIds(auth.user.id, auth.user.role);
-            const [series, issues] = await Promise.all([
+            const [series, matchedIssues] = await Promise.all([
                 searchSeriesRows(libs, terms),
                 searchIssueRows(libs, terms),
             ]);
+            // Reading order, and the caller's own position in each result — the same two things the
+            // other issue feeds carry.
+            const issues = issuesInReadingOrder(matchedIssues);
+            const progress = await progressByIssueId(auth.user.id, issues.map((i) => i.id));
             seriesEntries = series.map((s) => seriesEntry(baseUrl, s)).join('');
-            issueEntries = issues.map((i) => issueEntry(baseUrl, i.series, i, { pageCount: i.pageCount ?? 0 })).join('');
+            issueEntries = issues
+                .map((i) => issueEntry(baseUrl, i.series, i, {
+                    pageCount: i.pageCount ?? 0,
+                    progress: progress.get(i.id) ?? null,
+                }))
+                .join('');
             stamps = [...series.map((s) => s.updatedAt), ...issues.map((i) => i.updatedAt)];
         }
 

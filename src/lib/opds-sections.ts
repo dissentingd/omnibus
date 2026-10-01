@@ -14,6 +14,7 @@ import { escapeXml } from '@/lib/utils/xml';
 import { nestedSeriesAccessWhere, seriesAccessWhere, type AccessibleLibraries } from '@/lib/library-access';
 import { inProgressBooks, onDeckBooks } from '@/lib/komga/data';
 import { entryUpdated, issueEntry, type IssueProgress } from '@/lib/opds-feed';
+import { progressByIssueId } from '@/lib/opds-progress';
 
 /** How many entries a root section shows. */
 export const SECTION_SIZE = 20;
@@ -45,19 +46,6 @@ async function issuesByIds(ids: string[]) {
     });
     const byId = new Map(rows.map((r) => [r.id, r]));
     return ids.map((id) => byId.get(id)).filter((r): r is NonNullable<typeof r> => Boolean(r));
-}
-
-/**
- * The caller's own reading progress for a set of issues, keyed by issue id — what `pse:lastRead` is
- * built from. One query per feed; a section is 20 entries at most.
- */
-async function progressByIssueId(userId: string, issueIds: string[]) {
-    if (issueIds.length === 0) return new Map<string, IssueProgress>();
-    const rows = await prisma.readProgress.findMany({
-        where: { userId, issueId: { in: issueIds } },
-        select: { issueId: true, currentPage: true, updatedAt: true },
-    });
-    return new Map(rows.map((p) => [p.issueId, p]));
 }
 
 /** The entries for a set of issue rows, with the caller's progress folded into each one. */

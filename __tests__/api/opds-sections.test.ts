@@ -96,7 +96,7 @@ describe('GET /api/opds/sections/[name]', () => {
 
         expect(mocks.readProgress).toHaveBeenCalledWith({
             where: { userId: 'u1', issueId: { in: ['iss_1'] } },
-            select: { issueId: true, currentPage: true, updatedAt: true },
+            select: { issueId: true, currentPage: true, isCompleted: true, updatedAt: true },
         });
         expect(xml).toContain('pse:lastRead="7" pse:lastReadDate="2026-09-27T21:10:00.000Z"');
     });
