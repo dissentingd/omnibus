@@ -8,7 +8,8 @@ import AdmZip from 'adm-zip';
 // Logger writes to disk/console; stub it. Everything else runs against REAL archives in a temp dir —
 // the whole point is proving the fast central-directory count agrees with what the reader serves.
 
-import { countArchivePages, listArchivePages, readZipEntryNames, isPageCountable, isEngineCountable } from '@/lib/utils/archive-pages';
+import zlib from 'zlib';
+import { countArchivePages, listArchivePages, readZipEntryNames, readZipEntry, readArchivePage, isPageCountable, isEngineCountable } from '@/lib/utils/archive-pages';
 
 let root: string;
 
@@ -191,5 +192,120 @@ describe('listArchivePages', () => {
         const corrupt = path.join(root, 'corrupt.cbz');
         await fs.writeFile(corrupt, Buffer.from('this is definitely not a zip archive, not even close'));
         await expect(listArchivePages(corrupt)).rejects.toThrow();
+    });
+});
+
+// A real zip written byte by byte: local headers + data, central directory, end records. Lets the
+// tests choose each entry's compression (stored / deflated) and force the ZIP64 layout, where the
+// central directory says 0xFFFFFFFF and the real sizes and offsets live in the ZIP64 extra field.
+function writeZip(name: string, entries: { name: string; data: Buffer; method: 0 | 8 }[], zip64 = false): string {
+    const locals: Buffer[] = [];
+    const centrals: Buffer[] = [];
+    let offset = 0;
+    for (const e of entries) {
+        const nameBuf = Buffer.from(e.name, 'utf8');
+        const body = e.method === 8 ? zlib.deflateRawSync(e.data) : e.data;
+        const local = Buffer.alloc(30);
+        local.writeUInt32LE(0x04034b50, 0);
+        local.writeUInt16LE(zip64 ? 45 : 20, 4);
+        local.writeUInt16LE(0x0800, 6);                // UTF-8 names
+        local.writeUInt16LE(e.method, 8);
+        local.writeUInt32LE(zlib.crc32 ? zlib.crc32(e.data) : 0, 14);
+        local.writeUInt32LE(body.length, 18);
+        local.writeUInt32LE(e.data.length, 22);
+        local.writeUInt16LE(nameBuf.length, 26);
+        locals.push(local, nameBuf, body);
+
+        const extra = Buffer.alloc(zip64 ? 4 + 24 : 0);
+        if (zip64) {
+            extra.writeUInt16LE(0x0001, 0);
+            extra.writeUInt16LE(24, 2);
+            extra.writeBigUInt64LE(BigInt(e.data.length), 4);
+            extra.writeBigUInt64LE(BigInt(body.length), 12);
+            extra.writeBigUInt64LE(BigInt(offset), 20);
+        }
+        const central = Buffer.alloc(46);
+        central.writeUInt32LE(0x02014b50, 0);
+        central.writeUInt16LE(zip64 ? 45 : 20, 4);
+        central.writeUInt16LE(zip64 ? 45 : 20, 6);
+        central.writeUInt16LE(0x0800, 8);
+        central.writeUInt16LE(e.method, 10);
+        central.writeUInt32LE(zlib.crc32 ? zlib.crc32(e.data) : 0, 16);
+        central.writeUInt32LE(zip64 ? 0xffffffff : body.length, 20);
+        central.writeUInt32LE(zip64 ? 0xffffffff : e.data.length, 24);
+        central.writeUInt16LE(nameBuf.length, 28);
+        central.writeUInt16LE(extra.length, 30);
+        central.writeUInt32LE(zip64 ? 0xffffffff : offset, 42);
+        centrals.push(central, nameBuf, extra);
+        offset += 30 + nameBuf.length + body.length;
+    }
+    const cd = Buffer.concat(centrals);
+    const tail: Buffer[] = [];
+    if (zip64) {
+        const z64 = Buffer.alloc(56);
+        z64.writeUInt32LE(0x06064b50, 0);
+        z64.writeBigUInt64LE(BigInt(44), 4);
+        z64.writeBigUInt64LE(BigInt(entries.length), 24);
+        z64.writeBigUInt64LE(BigInt(entries.length), 32);
+        z64.writeBigUInt64LE(BigInt(cd.length), 40);
+        z64.writeBigUInt64LE(BigInt(offset), 48);
+        const locator = Buffer.alloc(20);
+        locator.writeUInt32LE(0x07064b50, 0);
+        locator.writeBigUInt64LE(BigInt(offset + cd.length), 8);
+        locator.writeUInt32LE(1, 16);
+        tail.push(z64, locator);
+    }
+    const eocd = Buffer.alloc(22);
+    eocd.writeUInt32LE(0x06054b50, 0);
+    eocd.writeUInt16LE(zip64 ? 0xffff : entries.length, 8);
+    eocd.writeUInt16LE(zip64 ? 0xffff : entries.length, 10);
+    eocd.writeUInt32LE(zip64 ? 0xffffffff : cd.length, 12);
+    eocd.writeUInt32LE(zip64 ? 0xffffffff : offset, 16);
+    const filePath = path.join(root, name);
+    fs.writeFileSync(filePath, Buffer.concat([...locals, cd, ...tail, eocd]));
+    return filePath;
+}
+
+describe('readZipEntry (one page from the index, without loading the archive)', () => {
+    const pageA = Buffer.from('stored page bytes '.repeat(20));
+    const pageB = Buffer.from('deflated page bytes '.repeat(50));
+
+    it('reads stored and deflated entries byte-for-byte', async () => {
+        const filePath = writeZip('mixed.cbz', [
+            { name: 'Vol 1/001.jpg', data: pageA, method: 0 },
+            { name: 'Vol 1/002.jpg', data: pageB, method: 8 },
+        ]);
+        expect(await readZipEntry(filePath, 'Vol 1/001.jpg')).toEqual(pageA);
+        expect(await readZipEntry(filePath, 'Vol 1/002.jpg')).toEqual(pageB);
+        expect(await readZipEntry(filePath, 'Vol 1/999.jpg')).toBeNull();
+    });
+
+    it('finds the real offsets and sizes in a ZIP64 archive\'s extra field', async () => {
+        const filePath = writeZip('compendium64.cbz', [
+            { name: '001.jpg', data: pageA, method: 0 },
+            { name: '002.jpg', data: pageB, method: 8 },
+        ], true);
+        expect(await readZipEntry(filePath, '002.jpg')).toEqual(pageB);
+        expect(await readZipEntry(filePath, '001.jpg')).toEqual(pageA);
+    });
+});
+
+describe('readArchivePage (what the reader serves when the engine is down)', () => {
+    it('returns exactly the bytes AdmZip would, for a real archive', async () => {
+        const filePath = buildCbz('real.cbz', {
+            'p01.jpg': 'page one '.repeat(30),
+            'Spawn - Café #01/p02.png': 'page two '.repeat(30),
+        });
+        const adm = new AdmZip(filePath);
+        for (const entry of ['p01.jpg', 'Spawn - Café #01/p02.png']) {
+            expect(await readArchivePage(filePath, entry)).toEqual(adm.getEntry(entry)!.getData());
+        }
+    });
+
+    it('matches a page the way the reader always has: exact name, backslash form, then file name', async () => {
+        const filePath = writeZip('names.cbz', [{ name: String.raw`Vol 2\003.jpg`, data: Buffer.from('three'), method: 0 }]);
+        expect((await readArchivePage(filePath, 'Vol 2/003.jpg'))?.toString()).toBe('three');
+        expect((await readArchivePage(filePath, 'elsewhere/003.jpg'))?.toString()).toBe('three');
+        expect(await readArchivePage(filePath, 'nope.jpg')).toBeNull();
     });
 });
