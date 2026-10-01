@@ -287,6 +287,8 @@ A completely custom, zero-friction reading experience built natively into the br
 ### External Readers & OPDS Support
 Omnibus features a native OPDS 1.2 server with the **Page Streaming Extension (PSE)**, allowing you to read your server's library directly in your favorite mobile and tablet apps without downloading the entire file first. Streaming covers `.cbz` and `.cbr`/`.rar` alike — RAR pages are served through the Rust engine, so Panels and friends can read your unconverted archives too.
 
+The catalog's home screen has **All Series**, **Continue Reading**, **Recently Added**, **On Deck** and, when you can see more than one library, **Libraries**, and apps that support OPDS search can search it by series or issue title. Streaming apps that support it resume each issue on the page Omnibus last recorded for you - from the web reader, KOReader sync or Paperback. Downloads carry the file's real type and name, and interrupted downloads can resume.
+
 **Supported OPDS Apps:**
 * **iOS / iPadOS:** Panels, Chunky
 * **Android:** Mihon, Tachiyomi, Moon+ Reader
@@ -668,7 +670,7 @@ Omnibus is built in the open, and it gets better every time someone sends a pull
 </a>
 
 * **[JoeJoeflyn](https://github.com/JoeJoeflyn)** — the comic panel-frame header navigation and app-wide button polish ([#186](https://github.com/hankscafe/omnibus/pull/186)), Omnibus' first merged community feature
-* **[realAbitbol](https://github.com/realAbitbol)** — OPDS feeds that publish the address your reader actually reached instead of the server's bind address ([#212](https://github.com/hankscafe/omnibus/pull/212), reported in [#210](https://github.com/hankscafe/omnibus/issues/210)), and KOReader progress sync that logs in and works end to end for the first time ([#213](https://github.com/hankscafe/omnibus/pull/213), reported in [#211](https://github.com/hankscafe/omnibus/issues/211))
+* **[realAbitbol](https://github.com/realAbitbol)** — OPDS feeds that publish the address your reader actually reached instead of the server's bind address ([#212](https://github.com/hankscafe/omnibus/pull/212), reported in [#210](https://github.com/hankscafe/omnibus/issues/210)), and KOReader progress sync that logs in and works end to end for the first time ([#213](https://github.com/hankscafe/omnibus/pull/213), reported in [#211](https://github.com/hankscafe/omnibus/issues/211)), downloads with the real file type, a correct filename and resumable Range requests ([#234](https://github.com/hankscafe/omnibus/pull/234), reported in [#219](https://github.com/hankscafe/omnibus/issues/219) and [#220](https://github.com/hankscafe/omnibus/issues/220)), standards-conforming OPDS feeds with real authors and dates ([#235](https://github.com/hankscafe/omnibus/pull/235), reported in [#218](https://github.com/hankscafe/omnibus/issues/218)), and OPDS search, Continue Reading / Recently Added / On Deck / Libraries sections and page-stream resume ([#236](https://github.com/hankscafe/omnibus/pull/236), reported in [#221](https://github.com/hankscafe/omnibus/issues/221))
 * **[CaptainEpix](https://github.com/CaptainEpix)** — the `{Imprint}` naming token, which files a series under its publisher imprint the same way everywhere Omnibus names folders and files: imports, watched folders, the Smart Matcher and Standardize ([#214](https://github.com/hankscafe/omnibus/pull/214), proposed in [#207](https://github.com/hankscafe/omnibus/issues/207))
 
 ### Bug Hunters & Field Testers
