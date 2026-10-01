@@ -592,8 +592,10 @@ struct ComicInfoSeriesDefaults {
     /// bookType (Print/OneShot/TPB/GN) derived from `format` — see book_type_from_comicinfo_format.
     /// A distinct field from `format` itself: `format` always carries the file's own raw Format
     /// text unchanged (e.g. "Director's Cut" survives exactly as tagged, untouched by this).
-    /// Only None when the file carries no Format tag at all -- absence of a signal is left
-    /// unclassified rather than guessed; any real tag value, recognized or not, does classify.
+    /// None both when the file carries no Format tag at all, and when it has one this doesn't
+    /// recognize as a specific collected-edition word -- review of #233: defaulting the latter to
+    /// Print bucketed real collected editions (Hardcover, Omnibus, Deluxe, ...) in with ordinary
+    /// periodicals, so an unrecognized Format now stays unclassified rather than guessed.
     book_type: Option<&'static str>,
     language_iso: Option<String>,
     age_rating: Option<String>,
@@ -638,10 +640,13 @@ impl ComicInfoSeriesDefaults {
 fn book_type_from_comicinfo_format(format: &str) -> Option<&'static str> {
     match format.trim().to_ascii_lowercase().as_str() {
         "one-shot" | "oneshot" | "one shot" => Some("OneShot"),
-        "tpb" | "trade paper back" | "trade paperback" => Some("TPB"),
-        "graphic novel" | "gn" => Some("GN"),
-        "" => None,
-        _ => Some("Print"),
+        // Review of #233: "any other real tag defaults to Print" bucketed real collected editions
+        // (a hardcover, an omnibus, a deluxe edition) in with ordinary periodicals. Only map the
+        // words that ARE a collected edition; a Format this doesn't recognize stays unset rather
+        // than guessed, same as no tag at all.
+        "tpb" | "tp" | "trade paper back" | "trade paperback" | "hc" | "hardcover" | "omnibus" | "deluxe" | "deluxe edition" => Some("TPB"),
+        "graphic novel" | "gn" | "ogn" => Some("GN"),
+        _ => None,
     }
 }
 
@@ -3373,6 +3378,71 @@ mod tests {
         assert_eq!(s3.get::<Option<String>, _>("publisher"), Some(String::new()));
     }
 
+    /// Review of #233: through the REAL 5H SQL (candidates query + fill UPDATE), not just the pure
+    /// book_type_from_comicinfo_format unit test -- a Series with a blank bookType and a real
+    /// on-disk file carrying a <Format>One-Shot</Format> tag ends up classified after the fill
+    /// step runs, exactly as a real scan would do it.
+    #[tokio::test]
+    async fn comicinfo_defaults_fill_classifies_book_type_from_a_real_files_format_tag() {
+        use std::io::Write as _;
+        use zip::{write::FileOptions, ZipWriter};
+
+        let dir = std::env::temp_dir().join(format!("omnibus_5h_booktype_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cbz = dir.join("One-Shot 001.cbz");
+        {
+            let f = std::fs::File::create(&cbz).unwrap();
+            let mut zw = ZipWriter::new(f);
+            let opts: FileOptions = FileOptions::default();
+            zw.start_file("ComicInfo.xml", opts).unwrap();
+            zw.write_all(br#"<?xml version="1.0"?><ComicInfo><Series>Winter Soldier</Series><Format>One-Shot</Format></ComicInfo>"#).unwrap();
+            zw.finish().unwrap();
+        }
+
+        static INIT: std::sync::Once = std::sync::Once::new();
+        INIT.call_once(sqlx::any::install_default_drivers);
+        let pool = sqlx::any::AnyPoolOptions::new().max_connections(1).connect("sqlite::memory:").await.unwrap();
+        sqlx::query(
+            r#"CREATE TABLE "Series" (id TEXT PRIMARY KEY, "libraryId" TEXT, imprint TEXT, tags TEXT,
+               format TEXT, "bookType" TEXT, "languageISO" TEXT, "ageRating" TEXT, "communityRating" REAL,
+               "blackAndWhite" INTEGER, gtin TEXT, notes TEXT, "scanInformation" TEXT, review TEXT,
+               "mainCharacterOrTeam" TEXT, "alternateSeries" TEXT, "alternateNumber" TEXT,
+               "alternateCount" INTEGER, "storyArcNumber" TEXT, inker TEXT, editor TEXT, translator TEXT)"#,
+        ).execute(&pool).await.unwrap();
+        sqlx::query(r#"CREATE TABLE "Issue" (id TEXT PRIMARY KEY, "seriesId" TEXT, "filePath" TEXT, number TEXT)"#)
+            .execute(&pool).await.unwrap();
+        sqlx::query(r#"INSERT INTO "Series" (id, "libraryId") VALUES ('s233', 'lib1')"#).execute(&pool).await.unwrap();
+        let cbz_str = cbz.to_string_lossy().replace('\\', "/");
+        sqlx::query(r#"INSERT INTO "Issue" (id, "seriesId", "filePath", number) VALUES ('i233', 's233', $1, '1')"#)
+            .bind(&cbz_str).execute(&pool).await.unwrap();
+
+        // The real candidate query: a blank bookType (among other blanks) makes this series a hit.
+        let candidates = sqlx::query(comicinfo_defaults_candidates_sql()).bind("lib1").fetch_all(&pool).await.unwrap();
+        assert_eq!(candidates.len(), 1);
+        let fp: String = candidates[0].get("fp");
+        assert_eq!(fp, cbz_str);
+
+        // The real read + derive path, then the real fill UPDATE.
+        let info = parse_comic_info(Path::new(&fp)).expect("parse the real archive");
+        let d = comicinfo_series_defaults(&info);
+        assert_eq!(d.book_type, Some("OneShot"));
+        let bw = match d.black_and_white { Some(true) => "true", Some(false) => "false", None => "NULL" };
+        sqlx::query(&comicinfo_defaults_fill_sql(bw))
+            .bind(&d.imprint).bind(&d.tags_json).bind(&d.format).bind(&d.language_iso).bind(&d.age_rating)
+            .bind(d.community_rating).bind(&d.gtin).bind(&d.notes).bind(&d.scan_information).bind(&d.review)
+            .bind(&d.main_character_or_team).bind(&d.alternate_series).bind(&d.alternate_number)
+            .bind(d.alternate_count).bind(&d.story_arc_number).bind(&d.inker_json).bind(&d.editor_json)
+            .bind(&d.translator_json).bind(d.book_type).bind("s233")
+            .execute(&pool).await.unwrap();
+
+        let row = sqlx::query(r#"SELECT "bookType", format FROM "Series" WHERE id = 's233'"#).fetch_one(&pool).await.unwrap();
+        assert_eq!(row.get::<Option<String>, _>("bookType"), Some("OneShot".to_string()));
+        assert_eq!(row.get::<Option<String>, _>("format"), Some("One-Shot".to_string()));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // ==== Discussion #177: trust embedded file metadata (Mylar-migrated libraries). ====
 
     // #199 read-side: the two all-caps serde renames (LanguageISO, GTIN) are the regression risk —
@@ -3420,18 +3490,23 @@ mod tests {
     }
 
     #[test]
-    fn book_type_from_comicinfo_format_classifies_explicit_types_and_defaults_the_rest_to_print() {
+    fn book_type_from_comicinfo_format_classifies_known_collected_editions_only() {
         assert_eq!(book_type_from_comicinfo_format("One-Shot"), Some("OneShot"));
         assert_eq!(book_type_from_comicinfo_format("one shot"), Some("OneShot"));
         assert_eq!(book_type_from_comicinfo_format("TPB"), Some("TPB"));
         assert_eq!(book_type_from_comicinfo_format("Trade Paper Back"), Some("TPB"));
         assert_eq!(book_type_from_comicinfo_format("Graphic Novel"), Some("GN"));
-        // Any other real tag is still real evidence of a Format -- it classifies Print, it isn't
-        // left unclassified, and this never touches the raw `format` column's own text.
-        assert_eq!(book_type_from_comicinfo_format("Director's Cut"), Some("Print"));
-        assert_eq!(book_type_from_comicinfo_format("Limited Series"), Some("Print"));
-        assert_eq!(book_type_from_comicinfo_format("Annual"), Some("Print"));
-        // No tag at all is not evidence of anything -- stays unclassified rather than guessed.
+        // Review of #233: these are real collected editions too, not ordinary periodicals.
+        assert_eq!(book_type_from_comicinfo_format("Hardcover"), Some("TPB"));
+        assert_eq!(book_type_from_comicinfo_format("HC"), Some("TPB"));
+        assert_eq!(book_type_from_comicinfo_format("Omnibus"), Some("TPB"));
+        assert_eq!(book_type_from_comicinfo_format("Deluxe"), Some("TPB"));
+        // An unrecognized Format (or no tag at all) is not evidence of anything specific -- stays
+        // unclassified rather than defaulting to Print, same as a missing tag. `format` itself
+        // always keeps the raw text regardless ("Director's Cut" is never lost).
+        assert_eq!(book_type_from_comicinfo_format("Director's Cut"), None);
+        assert_eq!(book_type_from_comicinfo_format("Limited Series"), None);
+        assert_eq!(book_type_from_comicinfo_format("Annual"), None);
         assert_eq!(book_type_from_comicinfo_format(""), None);
     }
 
