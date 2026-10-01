@@ -1893,7 +1893,7 @@ pub(crate) fn guess_book_type_from_cv_volume(vol_data: &serde_json::Value, curre
         Some("TPB")
     } else if vol_data["count_of_issues"].as_i64() == Some(1) {
         let start_year = vol_data["start_year"].as_str().and_then(|s| s.trim().parse::<i32>().ok()).unwrap_or(0);
-        if start_year > 0 && start_year <= current_year - 1 { Some("OneShot") } else { None }
+        if start_year > 0 && start_year < current_year { Some("OneShot") } else { None }
     } else {
         None
     }
