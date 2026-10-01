@@ -434,19 +434,39 @@ export async function POST(request: Request) {
         // silently no-ops the embed for every one of them. Repoint every affected row's filePath
         // prefix now that the physical move already happened -- pure DB correction, no filesystem writes.
         if (existingRecord?.id) {
+            // A bare prefix match (no trailing separator) also catches an unrelated sibling series
+            // whose own folder name starts with this one's — "Comics/Marvel/X" is a startsWith-prefix
+            // of "Comics/Marvel/X (2016)", so merging the former into a new home would otherwise also
+            // rewrite the LATTER series' own issues. Normalize both sides and require the separator.
+            const normOld = path.normalize(oldFolderPath).replace(/\\/g, '/').replace(/\/+$/, '');
+            const normNew = path.normalize(newFolderPath).replace(/\\/g, '/').replace(/\/+$/, '');
+            const oldPrefix = normOld + '/';
             const staleIssues = await prisma.issue.findMany({
-                where: { seriesId: existingRecord.id, filePath: { startsWith: oldFolderPath } }
+                where: { seriesId: existingRecord.id, filePath: { startsWith: oldPrefix } }
             });
+            const pathUpdates = [];
+            let leftInPlace = 0;
             for (const issue of staleIssues) {
                 if (!issue.filePath) continue;
-                const relative = issue.filePath.slice(oldFolderPath.length);
-                await prisma.issue.update({
-                    where: { id: issue.id },
-                    data: { filePath: newFolderPath + relative }
-                });
+                const relative = issue.filePath.slice(oldPrefix.length);
+                const movedPath = normNew + '/' + relative;
+                // safeRelocateFolder leaves a same-name collision at the OLD path rather than
+                // overwriting the destination (see its own conflict handling) -- repointing that row
+                // would point it at the file that's actually sitting in the collision's spot, not the
+                // file this row has always described. Only repoint when the move actually happened.
+                const normalizedIssuePath = issue.filePath.replace(/\\/g, '/');
+                if (fs.existsSync(movedPath) && !fs.existsSync(normalizedIssuePath)) {
+                    pathUpdates.push(prisma.issue.update({ where: { id: issue.id }, data: { filePath: movedPath } }));
+                } else {
+                    leftInPlace++;
+                }
             }
-            if (staleIssues.length > 0) {
-                Logger.log(`[Match Series] Repointed filePath for ${staleIssues.length} issue(s) after folder relocate.`, 'info');
+            if (pathUpdates.length > 0) {
+                await prisma.$transaction(pathUpdates).catch((err) => {
+                    Logger.log(`[Match Series] Repoint filePath transaction failed: ${getErrorMessage(err)}`, 'error');
+                });
+                Logger.log(`[Match Series] Repointed filePath for ${pathUpdates.length} issue(s) after folder relocate.`
+                    + (leftInPlace > 0 ? ` (${leftInPlace} left in place — name collision at the destination)` : ''), 'info');
             }
         }
     }
@@ -764,16 +784,19 @@ export async function POST(request: Request) {
         }
 
         // FIX (comicinfo-embed-race): this used to also queue a standalone EMBED_METADATA job here,
-        // racing the METADATA_SYNC job queued a few lines above -- both fire near-simultaneously,
-        // METADATA_SYNC's real ComicVine/Metron fetch lands 3-8s later, and this job would embed
-        // whatever was in the DB *before* that fetch completed, with nothing to re-trigger it
-        // afterward. Since METADATA_SYNC is unconditionally queued above whenever existingRecord?.id
-        // is set (the exact same guard this block used), it is always redundant with it -- the
-        // engine's own sync loop (metadata.rs) already embeds correctly, synchronously, right after
-        // its own fetch completes for this series, which naturally includes whatever custom
-        // SeriesGroup/Universe/Description the admin just set (file_metadata_priority means the sync
-        // never overwrites it). Removed rather than "fixed" with a delay/lock, since the already-
-        // correct path made it unnecessary in the first place.
+        // alongside the METADATA_SYNC job queued a few lines above for the same series. The engine
+        // can run both at once, and both embed jobs write through the SAME temp file for a given
+        // archive (path.with_extension("cbz.tmp") in metadata_writer.rs) -- two writers racing that
+        // path can clobber or corrupt each other's output. METADATA_SYNC already embeds on its own,
+        // synchronously, right after its fetch completes, so the standalone job was never adding
+        // anything; it only added a second writer to race against. Removed rather than locked.
+        //
+        // Cost of removing it: this admin edit (SeriesGroup/Universe/Description/etc.) now only
+        // reaches the files on METADATA_SYNC's own embed -- which doesn't happen if that fetch fails,
+        // or if a sync for this series is already in flight and this one gets skipped (metadata.rs's
+        // own in-progress guard). In either case the edit is saved in the DB but waits for the next
+        // successful sync/embed to actually land in the files. A per-file lock in the writer, so a
+        // dedicated embed job could safely coexist with METADATA_SYNC's, would close that gap.
     } catch (e: any) {
         Logger.log(`[Match Series] Failed to queue jobs: ${e.message}`, 'warn');
     }
