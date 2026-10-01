@@ -11,6 +11,7 @@ const mocks = vi.hoisted(() => ({
     validateApiKey: vi.fn(),
     findUniqueSeries: vi.fn(),
     updateIssue: vi.fn(),
+    readProgress: vi.fn().mockResolvedValue([]),
     countArchivePages: vi.fn(),
     countArchivePagesViaEngine: vi.fn(),
 }));
@@ -20,6 +21,7 @@ vi.mock('@/lib/db', () => ({
     prisma: {
         series: { findUnique: mocks.findUniqueSeries },
         issue: { update: mocks.updateIssue },
+        readProgress: { findMany: mocks.readProgress },
     }
 }));
 vi.mock('@/lib/library-access', () => ({
@@ -49,6 +51,7 @@ describe('API Route: OPDS Series Feed (/api/opds/series/[id])', () => {
     beforeEach(() => {
         mocks.validateApiKey.mockResolvedValue({ valid: true, user: { id: 'u1', role: 'ADMIN' } } as any);
         mocks.updateIssue.mockResolvedValue({});
+        mocks.readProgress.mockResolvedValue([]);
     });
 
     it('advertises the persisted pageCount as pse:count without touching the archive', async () => {
@@ -105,7 +108,10 @@ describe('API Route: OPDS Series Feed (/api/opds/series/[id])', () => {
         const res = await GET(createReq(), { params: createParams() }) as Response;
         const xml = await res.text();
 
-        expect(xml).toContain('pse:count="0"');
+        // No count means no page stream at all: `pse:count="0"` is a stream a client cannot render.
+        // The acquisition link still stands.
+        expect(xml).not.toContain('pse:count');
+        expect(xml).toContain('rel="http://opds-spec.org/acquisition"');
         expect(mocks.updateIssue).not.toHaveBeenCalled();
     });
 
@@ -187,6 +193,18 @@ describe('API Route: OPDS Series Feed — entry conformance', () => {
         expect(bare.xml).toContain('<author><name>Omnibus</name></author>');
     });
 
+    // A credit refresh that finds nothing writes `JSON.stringify([])` rather than null, so an empty
+    // list has to count as absent too — otherwise the entry carries no <author> although the series
+    // has writers.
+    it('falls back to the series creators when the issue\'s own credits are an empty list', async () => {
+        const { xml } = await feedFor({ id: 'u1', role: 'ADMIN' }, {
+            issues: [issue({ writers: '[]', artists: '[]' })],
+        });
+
+        expect(xml).toContain('<author><name>Tom King</name></author>');
+        expect(xml).toContain('<author><name>Mikel Janín</name></author>');
+    });
+
     it('titles an issue "Series #N - Title", reducing to "Series #N" when the title adds nothing', async () => {
         const { xml } = await feedFor({ id: 'u1', role: 'ADMIN' }, {
             issues: [
@@ -237,5 +255,52 @@ describe('API Route: OPDS Series Feed — entry conformance', () => {
         const { xml } = await feedFor({ id: 'u1', role: 'ADMIN' }, { issues: [issue()] });
 
         expect(xml).toContain('rel="http://vaemendis.net/opds-pse/stream" type="image/webp"');
+    });
+
+    // #221 point 3: a page-streaming client resumes where this user stopped. The stored currentPage
+    // is the app's 0-based index, so the attribute carries the 1-based page number OPDS-PSE expects.
+    it('adds pse:lastRead / pse:lastReadDate from the caller\'s own progress', async () => {
+        mocks.readProgress.mockResolvedValue([
+            { issueId: 'iss_1', currentPage: 6, updatedAt: new Date('2026-09-27T12:00:00.000Z') },
+        ]);
+
+        const { xml } = await feedFor({ id: 'u1', role: 'ADMIN' }, { issues: [issue({ id: 'iss_1' })] });
+
+        expect(xml).toContain('pse:lastRead="7"');
+        expect(xml).toContain('pse:lastReadDate="2026-09-27T12:00:00.000Z"');
+    });
+
+    it('omits the read attributes for an issue the caller has not started', async () => {
+        mocks.readProgress.mockResolvedValue([]);
+
+        const { xml } = await feedFor({ id: 'u1', role: 'ADMIN' }, { issues: [issue()] });
+
+        expect(xml).not.toContain('pse:lastRead');
+    });
+
+    // A finished issue stores the page count itself as its position — KOReader's finished sync and the
+    // Komga mark-read both write it that way — so `currentPage + 1` would report one page past the end.
+    it('reports the last page for a finished issue, never one past it', async () => {
+        mocks.readProgress.mockResolvedValue([
+            { issueId: 'iss_1', currentPage: 22, isCompleted: true, updatedAt: new Date('2026-09-27T12:00:00.000Z') },
+        ]);
+
+        const { xml } = await feedFor({ id: 'u1', role: 'ADMIN' }, { issues: [issue({ id: 'iss_1' })] });
+
+        expect(xml).toContain('pse:count="22"');
+        expect(xml).toContain('pse:lastRead="22"');
+        expect(xml).not.toContain('pse:lastRead="23"');
+    });
+
+    // The count can move under a stored position (a re-scan, a re-numbered archive): the page a client
+    // is sent to stays inside the file.
+    it('clamps a stale position to the page count', async () => {
+        mocks.readProgress.mockResolvedValue([
+            { issueId: 'iss_1', currentPage: 40, isCompleted: false, updatedAt: new Date('2026-09-27T12:00:00.000Z') },
+        ]);
+
+        const { xml } = await feedFor({ id: 'u1', role: 'ADMIN' }, { issues: [issue({ id: 'iss_1' })] });
+
+        expect(xml).toContain('pse:lastRead="22"');
     });
 });
