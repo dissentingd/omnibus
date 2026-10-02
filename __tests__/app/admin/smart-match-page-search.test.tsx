@@ -260,8 +260,7 @@ describe('Smart Matcher — Start Auto-Scan error handling (review of #231)', ()
         // FIX (review of #231): a 500 from /api/search used to fall through to `data.results || []`
         // — an empty list, identical to a genuine no-match — and get recorded as NOT_FOUND, which the
         // scan never retries. Routing a non-ok response through the catch block instead records
-        // ERROR, which IS retried (the autoscan-retry-gap fix only skips a row holding a real
-        // suggestion object).
+        // ERROR, which the next scan retries.
         stubFetchRouter([
             ['/api/admin/unmatched', () => ok([RAW_ITEM])],
             ['/api/admin/config', () => ok({
@@ -278,4 +277,40 @@ describe('Smart Matcher — Start Auto-Scan error handling (review of #231)', ()
         await screen.findByText('Search failed. Rate limit hit?');
         expect(screen.queryByText('No confident match found.')).toBeNull();
     });
+
+    it('retries an ERROR row on the next scan, but not a NOT_FOUND row', async () => {
+        const OTHER = { ...RAW_ITEM, id: 'raw_WmFnb3I', name: 'Zagor 001', folderPath: '/unmatched/Zagor 001.cbz' };
+        const searches: string[] = [];
+        stubFetchRouter([
+            ['/api/admin/unmatched', () => ok([RAW_ITEM, OTHER])],
+            ['/api/admin/config', () => ok({
+                settings: [{ key: 'primary_metadata_source', value: 'METRON' }],
+            })],
+            ['/api/admin/sweep', () => ok({})],
+            ['/api/search', (u) => {
+                searches.push(u);
+                // Conan errors; Zagor genuinely has nothing on the provider.
+                return u.includes('Conan') ? err(500, { error: 'Failed to fetch data' }) : ok({ results: [], hasMore: false });
+            }],
+        ]);
+
+        render(<SmartMatchPage />);
+        await screen.findByText('Conan & Dragonero 001');
+        const start = () => fireEvent.click(screen.getByRole('button', { name: /Start Auto-Scan/ }));
+
+        start();
+        // The scan pauses 1.5 s between rows, so these waits outlast the default 1 s.
+        const slow = { timeout: 5000 };
+        await screen.findByText('Search failed. Rate limit hit?', {}, slow);
+        await screen.findByText('No confident match found.', {}, slow);
+        await screen.findByRole('button', { name: /Start Auto-Scan/ }, slow);
+        expect(searches).toHaveLength(2);
+
+        searches.length = 0;
+        start();
+        await waitFor(() => expect(searches).toHaveLength(1), slow);
+        await screen.findByRole('button', { name: /Start Auto-Scan/ }, slow);
+        expect(searches).toHaveLength(1);
+        expect(searches[0]).toContain('Conan');
+    }, 15000);
 });
