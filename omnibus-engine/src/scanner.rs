@@ -638,13 +638,12 @@ impl ComicInfoSeriesDefaults {
 
 /// A file's own <Format> tag (e.g. from the original ComicRack/ComicTagger tagging) is ground
 /// truth this library already relies on throughout. The Mylar-spec bookType column the admin UI's
-/// book-type filter queries is a closed four-value enum (Print/OneShot/TPB/GN), so a real Format
-/// value that isn't explicitly one of the three collected-edition types ("Limited Series",
-/// "Director's Cut", "Annual", "Preview", "Black & White", …) still classifies -- as Print, the
-/// ordinary-periodical-issue bucket -- since carrying ANY Format tag is itself real evidence
-/// this isn't an unclassified series. `format` itself is never touched by this: it always keeps
-/// the file's raw tag text unchanged, so "Director's Cut" is never lost, only additionally
-/// classified Print for the filter. Only a file with NO Format tag at all leaves bookType alone.
+/// book-type filter queries is a closed four-value enum (Print/OneShot/TPB/GN). Only Format words
+/// that name one of those types map; anything else ("Limited Series", "Director's Cut", "Annual",
+/// "Preview", "Black & White", …) leaves bookType unset, exactly like a file with no Format tag.
+/// A guess here would be permanent -- every source only fills a blank -- and would block a real
+/// classification (Metron's series_type) from ever landing. `format` itself is never touched by
+/// this: it always keeps the file's raw tag text unchanged.
 fn book_type_from_comicinfo_format(format: &str) -> Option<&'static str> {
     match format.trim().to_ascii_lowercase().as_str() {
         "one-shot" | "oneshot" | "one shot" => Some("OneShot"),
