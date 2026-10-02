@@ -424,12 +424,10 @@ export default function SmartMatchPage() {
             // An ignored series is visible only while the toggle is on; scanning it would put a
             // suggestion back on a row the admin has already dealt with.
             if (series.isIgnored) continue;
-            // FIX (autoscan-retry-gap): skipping on any truthy cached value meant a series that came
-            // back NOT_FOUND or ERROR earlier in this tab's session got silently skipped by every
-            // later click forever (session-scoped cache, 12h TTL) -- it never became a reviewable
-            // suggestion, but the scan also never tried it again. Only a real candidate object should
-            // count as "already handled"; the sentinel strings should still be retried.
-            if (suggestions[series.id] && typeof suggestions[series.id] === 'object') continue;
+            // Only an ERROR is retried. A suggestion is already handled, and a NOT_FOUND would come
+            // back the same: /api/search caches every result list for 12 hours, empty ones included,
+            // so retrying it only adds the per-row pause below.
+            if (suggestions[series.id] && suggestions[series.id] !== 'ERROR') continue;
 
             try {
                 // The search term is the SERIES, not the file: a loose file arrives as its filename
