@@ -442,31 +442,53 @@ export async function POST(request: Request) {
             const normNew = path.normalize(newFolderPath).replace(/\\/g, '/').replace(/\/+$/, '');
             const oldPrefix = normOld + '/';
             const staleIssues = await prisma.issue.findMany({
-                where: { seriesId: existingRecord.id, filePath: { startsWith: oldPrefix } }
+                where: { seriesId: existingRecord.id, filePath: { startsWith: oldPrefix } },
+                select: { id: true, filePath: true }
             });
+            // Async probes: a big series on a network share would otherwise block the event loop
+            // with two sync stats per issue.
+            const exists = (p: string) => fs.promises.access(p).then(() => true, () => false);
+            const probes = await Promise.all(staleIssues.map(async (issue) => {
+                if (!issue.filePath) return null;
+                const movedPath = normNew + '/' + issue.filePath.slice(oldPrefix.length);
+                // The stored path is probed as-is: on Linux "\" is an ordinary filename character, so
+                // normalising it would miss a file that never left and repoint its row.
+                const [atNew, atOld] = await Promise.all([exists(movedPath), exists(issue.filePath)]);
+                return { id: issue.id, movedPath, atNew, atOld };
+            }));
             const pathUpdates = [];
-            let leftInPlace = 0;
-            for (const issue of staleIssues) {
-                if (!issue.filePath) continue;
-                const relative = issue.filePath.slice(oldPrefix.length);
-                const movedPath = normNew + '/' + relative;
+            let leftAtOld = 0;
+            let missing = 0;
+            for (const probe of probes) {
+                if (!probe) continue;
                 // safeRelocateFolder leaves a same-name collision at the OLD path rather than
                 // overwriting the destination (see its own conflict handling) -- repointing that row
                 // would point it at the file that's actually sitting in the collision's spot, not the
                 // file this row has always described. Only repoint when the move actually happened.
-                const normalizedIssuePath = issue.filePath.replace(/\\/g, '/');
-                if (fs.existsSync(movedPath) && !fs.existsSync(normalizedIssuePath)) {
-                    pathUpdates.push(prisma.issue.update({ where: { id: issue.id }, data: { filePath: movedPath } }));
+                if (probe.atOld) {
+                    leftAtOld++;
+                } else if (probe.atNew) {
+                    pathUpdates.push(prisma.issue.update({ where: { id: probe.id }, data: { filePath: probe.movedPath } }));
                 } else {
-                    leftInPlace++;
+                    missing++;
                 }
             }
+            const notes = [
+                ...(leftAtOld > 0 ? [`${leftAtOld} left at the old path (usually a same-named file already at the destination)`] : []),
+                ...(missing > 0 ? [`${missing} not found at the old or the new path`] : []),
+            ];
+            const level = missing > 0 ? 'warn' : 'info';
             if (pathUpdates.length > 0) {
-                await prisma.$transaction(pathUpdates).catch((err) => {
-                    Logger.log(`[Match Series] Repoint filePath transaction failed: ${getErrorMessage(err)}`, 'error');
+                const committed = await prisma.$transaction(pathUpdates).then(() => true, (err) => {
+                    Logger.log(`[Match Series] Repoint filePath transaction failed; ${pathUpdates.length} issue(s) still point at the old folder: ${getErrorMessage(err)}`, 'error');
+                    return false;
                 });
-                Logger.log(`[Match Series] Repointed filePath for ${pathUpdates.length} issue(s) after folder relocate.`
-                    + (leftInPlace > 0 ? ` (${leftInPlace} left in place — name collision at the destination)` : ''), 'info');
+                if (committed) {
+                    Logger.log(`[Match Series] Repointed filePath for ${pathUpdates.length} issue(s) after folder relocate.`
+                        + (notes.length > 0 ? ` (${notes.join('; ')})` : ''), level);
+                }
+            } else if (notes.length > 0) {
+                Logger.log(`[Match Series] No filePath repointed after folder relocate: ${notes.join('; ')}.`, level);
             }
         }
     }

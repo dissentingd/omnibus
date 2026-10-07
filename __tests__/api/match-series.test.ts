@@ -1,9 +1,10 @@
 // __tests__/api/match-series.test.ts
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { POST } from '@/app/api/library/match-series/route';
 import fs from 'fs';
 import axios from 'axios';
 import { makePostJson } from '../helpers/request';
+import { Logger } from '@/lib/logger';
 
 // 1. Hoist the mocks
 const mocks = vi.hoisted(() => ({
@@ -68,6 +69,7 @@ vi.mock('fs', () => ({
         existsSync: vi.fn().mockReturnValue(true),
         mkdirSync: vi.fn(),
         promises: {
+            access: vi.fn().mockResolvedValue(undefined),
             stat: vi.fn().mockResolvedValue({ isFile: () => false }),
             readdir: vi.fn().mockResolvedValue([]),
             rename: vi.fn().mockResolvedValue(true),
@@ -103,6 +105,7 @@ describe('API Route: Smart Matcher (/api/library/match-series)', () => {
         // clearAllMocks resets call history but NOT implementations — restore the fs.existsSync default
         // so a per-test mockImplementation can't leak into later tests.
         vi.mocked(fs.existsSync).mockReturnValue(true);
+        vi.mocked(fs.promises.access).mockResolvedValue(undefined);
         // Setup default path access
         process.env.OMNIBUS_AWAITING_MATCH_DIR = '/unmatched';
         mocks.findManyLibraries.mockResolvedValue([{ id: 'lib_1', path: '/comics', isDefault: true }]);
@@ -343,77 +346,163 @@ describe('API Route: Smart Matcher (/api/library/match-series)', () => {
             publisher: 'DC Comics',
         });
 
+        let logSpy: ReturnType<typeof vi.spyOn>;
+        const logLines = (): string[] => logSpy.mock.calls.map((c: any[]) => String(c[0]));
+
+        // The disk AFTER safeRelocateFolder ran: exactly the listed paths exist. Drives both the
+        // route's sync precondition checks (existsSync) and the repoint's async probes (access).
+        const onDisk = (...paths: string[]) => {
+            const has = (p: any) => paths.includes(String(p));
+            vi.mocked(fs.existsSync).mockImplementation(has);
+            vi.mocked(fs.promises.access).mockImplementation(async (p: any) => {
+                if (!has(p)) throw Object.assign(new Error(`ENOENT: ${p}`), { code: 'ENOENT' });
+            });
+        };
+        const issueRows = (rows: { id: string; filePath: string }[]) =>
+            mocks.findManyIssues.mockImplementation(({ where }: any) =>
+                Promise.resolve(rows.filter(i => i.filePath.startsWith(where.filePath.startsWith)))
+            );
+
         beforeEach(() => {
             mocks.findUniqueSeries.mockResolvedValue({ id: 'series_123', year: 2016, isManga: false });
             mocks.updateSeries.mockResolvedValue({ id: 'series_123', folderPath: NEW_FOLDER });
             mocks.transaction.mockImplementation((ops: any[]) => Promise.all(ops));
+            logSpy = vi.spyOn(Logger, 'log').mockImplementation(() => undefined as any);
         });
+        afterEach(() => logSpy.mockRestore());
 
         it('repoints every sibling issue under the relocated folder, in one transaction', async () => {
-            const issues = [
+            issueRows([
                 { id: 'i1', filePath: '/unmatched/Batman/Batman 001.cbz' },
                 { id: 'i2', filePath: '/unmatched/Batman/Batman 002.cbz' },
-            ];
-            mocks.findManyIssues.mockImplementation(({ where }: any) =>
-                Promise.resolve(issues.filter(i => i.filePath.startsWith(where.filePath.startsWith)))
-            );
+            ]);
             // The physical move already happened (safeRelocateFolder's job) -- new paths exist, old ones
             // don't, except the matched folder itself which the route's own precondition check requires.
-            vi.mocked(fs.existsSync).mockImplementation((p: any) => {
-                const s = String(p);
-                return s === '/unmatched/Batman' || s.startsWith(NEW_FOLDER);
-            });
+            onDisk('/unmatched/Batman', NEW_FOLDER, `${NEW_FOLDER}/Batman 001.cbz`, `${NEW_FOLDER}/Batman 002.cbz`);
 
             const res = await POST(matchReq());
             expect(res.status).toBe(200);
 
-            // Queried with a trailing separator, not a bare prefix.
+            // Queried with a trailing separator, not a bare prefix, and only for the two columns used.
             expect(mocks.findManyIssues).toHaveBeenCalledWith(expect.objectContaining({
-                where: expect.objectContaining({ filePath: { startsWith: '/unmatched/Batman/' } })
+                where: expect.objectContaining({ filePath: { startsWith: '/unmatched/Batman/' } }),
+                select: { id: true, filePath: true },
             }));
             expect(mocks.transaction).toHaveBeenCalledTimes(1);
             expect(mocks.updateIssue).toHaveBeenCalledWith({ where: { id: 'i1' }, data: { filePath: `${NEW_FOLDER}/Batman 001.cbz` } });
             expect(mocks.updateIssue).toHaveBeenCalledWith({ where: { id: 'i2' }, data: { filePath: `${NEW_FOLDER}/Batman 002.cbz` } });
+            // Per-row existence probes are async (a big series on a network share must not block
+            // the event loop with hundreds of sync stats).
+            expect(fs.promises.access).toHaveBeenCalledWith('/unmatched/Batman/Batman 001.cbz');
+            expect(fs.existsSync).not.toHaveBeenCalledWith('/unmatched/Batman/Batman 001.cbz');
+            expect(fs.existsSync).not.toHaveBeenCalledWith(`${NEW_FOLDER}/Batman 001.cbz`);
+            expect(logLines()).toContainEqual(expect.stringContaining('Repointed filePath for 2 issue(s)'));
         });
 
-        it('leaves an unrelated sibling series ("Batman" vs "Batman Family") untouched', async () => {
+        it('never even considers an unrelated sibling series ("Batman" vs "Batman Family")', async () => {
             // "Batman Family"'s own issue starts with the bare string "/unmatched/Batman" but is NOT
-            // under "/unmatched/Batman/" -- a startsWith with no trailing separator would have caught it.
-            const siblingIssue = { id: 'sibling_1', filePath: '/unmatched/Batman Family/Annual 001.cbz' };
-            mocks.findManyIssues.mockImplementation(({ where }: any) =>
-                Promise.resolve([siblingIssue].filter(i => i.filePath.startsWith(where.filePath.startsWith)))
-            );
-            vi.mocked(fs.existsSync).mockReturnValue(true);
+            // under "/unmatched/Batman/". Its file is still at its own path (it's another series'
+            // folder), so even a bare-prefix query couldn't repoint it -- what pins the separator is
+            // that the row is never fetched, so its path is never probed.
+            issueRows([{ id: 'sibling_1', filePath: '/unmatched/Batman Family/Annual 001.cbz' }]);
+            onDisk('/unmatched/Batman', NEW_FOLDER, '/unmatched/Batman Family/Annual 001.cbz');
 
             const res = await POST(matchReq());
             expect(res.status).toBe(200);
 
+            expect(fs.promises.access).not.toHaveBeenCalledWith('/unmatched/Batman Family/Annual 001.cbz');
             expect(mocks.updateIssue).not.toHaveBeenCalledWith(expect.objectContaining({ where: { id: 'sibling_1' } }));
         });
 
+        it('merging "X" into an existing "X (2016)" repoints the moved issues and never touches the destination series\' own', async () => {
+            // The #230 review case: the old folder is a startsWith-prefix of the destination folder.
+            // The match merged the source series' rows into series_123, which already owned issues
+            // under the destination.
+            const oldFolder = '/comics/DC Comics/Batman';
+            issueRows([
+                { id: 'moved', filePath: `${oldFolder}/Batman 001.cbz` },
+                { id: 'dest_own', filePath: `${NEW_FOLDER}/Batman 010.cbz` },
+            ]);
+            onDisk(oldFolder, NEW_FOLDER, `${NEW_FOLDER}/Batman 001.cbz`, `${NEW_FOLDER}/Batman 010.cbz`);
+
+            const res = await POST(createReq({
+                oldFolderPath: oldFolder, metadataId: '4050-1234', name: 'Batman', year: 2016, publisher: 'DC Comics',
+            }));
+            expect(res.status).toBe(200);
+
+            expect(mocks.findManyIssues).toHaveBeenCalledWith(expect.objectContaining({
+                where: expect.objectContaining({ filePath: { startsWith: `${oldFolder}/` } }),
+            }));
+            expect(mocks.updateIssue).toHaveBeenCalledWith({ where: { id: 'moved' }, data: { filePath: `${NEW_FOLDER}/Batman 001.cbz` } });
+            expect(mocks.updateIssue).not.toHaveBeenCalledWith(expect.objectContaining({ where: { id: 'dest_own' } }));
+            expect(fs.promises.access).not.toHaveBeenCalledWith(`${NEW_FOLDER}/Batman 010.cbz`);
+        });
+
         it('leaves a row pointing at a name-collision file in place (safeRelocateFolder left it at the old path)', async () => {
-            const issues = [
+            issueRows([
                 { id: 'moved', filePath: '/unmatched/Batman/Batman 001.cbz' },
                 { id: 'collided', filePath: '/unmatched/Batman/Batman 002.cbz' },
-            ];
-            mocks.findManyIssues.mockImplementation(({ where }: any) =>
-                Promise.resolve(issues.filter(i => i.filePath.startsWith(where.filePath.startsWith)))
-            );
+            ]);
             // "001" moved cleanly (new exists, old doesn't). "002" collided with a same-named file
             // already at the destination -- safeRelocateFolder left the source file in place, so
             // BOTH the old and new paths exist, and this row must not be repointed.
-            vi.mocked(fs.existsSync).mockImplementation((p: any) => {
-                const s = String(p);
-                if (s === `${NEW_FOLDER}/Batman 001.cbz`) return true;
-                if (s === '/unmatched/Batman/Batman 001.cbz') return false;
-                return true; // both paths exist for 002 (and everything else probed)
-            });
+            onDisk('/unmatched/Batman', NEW_FOLDER,
+                `${NEW_FOLDER}/Batman 001.cbz`,
+                `${NEW_FOLDER}/Batman 002.cbz`, '/unmatched/Batman/Batman 002.cbz');
 
             const res = await POST(matchReq());
             expect(res.status).toBe(200);
 
             expect(mocks.updateIssue).toHaveBeenCalledWith({ where: { id: 'moved' }, data: { filePath: `${NEW_FOLDER}/Batman 001.cbz` } });
             expect(mocks.updateIssue).not.toHaveBeenCalledWith(expect.objectContaining({ where: { id: 'collided' } }));
+            const summary = logLines().find(l => l.includes('Repointed filePath for 1 issue(s)'));
+            expect(summary).toContain('1 left at the old path');
+        });
+
+        it('checks the stored path as-is: a left-behind file with a backslash in its name keeps its row', async () => {
+            // On Linux "\" is an ordinary filename character. Normalising it to "/" before the probe
+            // looked for ".../AC/DC 001.cbz", found nothing, decided the file had moved, and pointed the
+            // row at the destination's same-named file -- two rows, one file.
+            const leftBehind = '/unmatched/Batman/AC\\DC 001.cbz';
+            issueRows([{ id: 'acdc', filePath: leftBehind }]);
+            onDisk('/unmatched/Batman', NEW_FOLDER, leftBehind, `${NEW_FOLDER}/AC\\DC 001.cbz`);
+
+            const res = await POST(matchReq());
+            expect(res.status).toBe(200);
+
+            expect(fs.promises.access).toHaveBeenCalledWith(leftBehind);
+            expect(mocks.updateIssue).not.toHaveBeenCalledWith(expect.objectContaining({ where: { id: 'acdc' } }));
+        });
+
+        it('logs success only when the repoint transaction commits', async () => {
+            issueRows([{ id: 'i1', filePath: '/unmatched/Batman/Batman 001.cbz' }]);
+            onDisk('/unmatched/Batman', NEW_FOLDER, `${NEW_FOLDER}/Batman 001.cbz`);
+            mocks.transaction.mockRejectedValueOnce(new Error('database is locked'));
+
+            const res = await POST(matchReq());
+            expect(res.status).toBe(200);
+
+            const lines = logLines();
+            expect(lines).toContainEqual(expect.stringContaining('database is locked'));
+            expect(lines).not.toContainEqual(expect.stringContaining('Repointed filePath'));
+        });
+
+        it('still reports when nothing was repointed, and tells a left-behind file apart from a missing one', async () => {
+            issueRows([
+                { id: 'collided', filePath: '/unmatched/Batman/Batman 002.cbz' },
+                { id: 'gone', filePath: '/unmatched/Batman/Batman 003.cbz' },
+            ]);
+            // 002 is still at the old path (collision); 003 exists at neither path.
+            onDisk('/unmatched/Batman', NEW_FOLDER, `${NEW_FOLDER}/Batman 002.cbz`, '/unmatched/Batman/Batman 002.cbz');
+
+            const res = await POST(matchReq());
+            expect(res.status).toBe(200);
+
+            expect(mocks.transaction).not.toHaveBeenCalled();
+            const summary = logLines().find(l => l.includes('No filePath repointed'));
+            expect(summary).toBeDefined();
+            expect(summary).toContain('1 left at the old path');
+            expect(summary).toContain('1 not found at the old or the new path');
         });
     });
 
