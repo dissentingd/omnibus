@@ -651,8 +651,9 @@ fn book_type_from_comicinfo_format(format: &str) -> Option<&'static str> {
         // (a hardcover, an omnibus, a deluxe edition) in with ordinary periodicals. Only map the
         // words that ARE a collected edition; a Format this doesn't recognize stays unset rather
         // than guessed, same as no tag at all.
-        "tpb" | "tp" | "trade paper back" | "trade paperback" | "hc" | "hardcover" | "omnibus" | "deluxe" | "deluxe edition" => Some("TPB"),
-        "graphic novel" | "gn" | "ogn" => Some("GN"),
+        "tpb" | "tp" | "trade paper back" | "trade paperback" | "hc" | "hardcover" | "hard-cover" | "hard cover"
+        | "hardback" | "omnibus" | "deluxe" | "deluxe edition" => Some("TPB"),
+        "graphic novel" | "original graphic novel" | "gn" | "ogn" => Some("GN"),
         _ => None,
     }
 }
@@ -708,6 +709,7 @@ fn comicinfo_defaults_candidates_sql() -> &'static str {
     r#"SELECT s.id AS sid,
               (SELECT i."filePath" FROM "Issue" i
                 WHERE i."seriesId" = s.id AND i."filePath" IS NOT NULL AND i."filePath" <> ''
+                  AND i."attachedVolumeId" IS NULL AND i."isAnnual" = false
                 ORDER BY i.number LIMIT 1) AS fp
        FROM "Series" s
        WHERE s."libraryId" = $1 AND (
@@ -743,7 +745,6 @@ fn comicinfo_defaults_fill_sql(bw_literal: &str) -> String {
            imprint = COALESCE(NULLIF(imprint, ''), $1, imprint),
            tags = COALESCE(NULLIF(NULLIF(tags, ''), '[]'), $2, tags),
            format = COALESCE(NULLIF(format, ''), $3, format),
-           "bookType" = COALESCE(NULLIF("bookType", ''), $19, "bookType"),
            "languageISO" = COALESCE(NULLIF("languageISO", ''), $4, "languageISO"),
            "ageRating" = COALESCE(NULLIF("ageRating", ''), $5, "ageRating"),
            "communityRating" = COALESCE("communityRating", $6),
@@ -759,6 +760,7 @@ fn comicinfo_defaults_fill_sql(bw_literal: &str) -> String {
            inker = COALESCE(NULLIF(NULLIF(inker, ''), '[]'), $16, inker),
            editor = COALESCE(NULLIF(NULLIF(editor, ''), '[]'), $17, editor),
            translator = COALESCE(NULLIF(NULLIF(translator, ''), '[]'), $18, translator),
+           "bookType" = COALESCE(NULLIF("bookType", ''), $19, "bookType"),
            "blackAndWhite" = COALESCE("blackAndWhite", {bw})
        WHERE id = $20"#,
         bw = bw_literal
@@ -2754,7 +2756,7 @@ pub async fn scan_library(db: Db, library_path: String, library_id: String, spec
                 // Per-column blank guards live in the UPDATE itself (same reasoning as 5E), so a
                 // concurrent provider sync writing a real value between our SELECT and now can't be
                 // clobbered.
-                if sqlx::query(series_json_fill_blanks_sql())
+                match sqlx::query(series_json_fill_blanks_sql())
                 .bind(&sj.description)
                 .bind(&sj.status)
                 .bind(&sj.booktype)
@@ -2763,12 +2765,15 @@ pub async fn scan_library(db: Db, library_path: String, library_id: String, spec
                 .bind(sid)
                 .execute(&mut *tx)
                 .await
-                .is_ok()
                 {
-                    n += 1;
+                    Ok(_) => n += 1,
+                    Err(e) => log::warn!("[Scan] 5F series.json fill failed for series {}: {}", sid, e),
                 }
             }
-            if tx.commit().await.is_ok() { sj_filled += n; }
+            match tx.commit().await {
+                Ok(_) => sj_filled += n,
+                Err(e) => log::warn!("[Scan] 5F series.json fill: commit failed, {} update(s) lost: {}", n, e),
+            }
         }
         if sj_filled > 0 { log::info!("[Scan] Re-flowed series.json fields into {} existing series (fill-blank only).", sj_filled); }
     }
@@ -2947,7 +2952,7 @@ pub async fn scan_library(db: Db, library_path: String, library_id: String, spec
             let mut n = 0;
             for (sid, d) in chunk {
                 let bw = match d.black_and_white { Some(true) => "true", Some(false) => "false", None => "NULL" };
-                if sqlx::query(&comicinfo_defaults_fill_sql(bw))
+                match sqlx::query(&comicinfo_defaults_fill_sql(bw))
                     .bind(&d.imprint)
                     .bind(&d.tags_json)
                     .bind(&d.format)
@@ -2970,12 +2975,15 @@ pub async fn scan_library(db: Db, library_path: String, library_id: String, spec
                     .bind(sid)
                     .execute(&mut *tx)
                     .await
-                    .is_ok()
                 {
-                    n += 1;
+                    Ok(_) => n += 1,
+                    Err(e) => log::warn!("[Scan] 5H ComicInfo defaults fill failed for series {}: {}", sid, e),
                 }
             }
-            if tx.commit().await.is_ok() { ci_filled += n; }
+            match tx.commit().await {
+                Ok(_) => ci_filled += n,
+                Err(e) => log::warn!("[Scan] 5H ComicInfo defaults fill: commit failed, {} update(s) lost: {}", n, e),
+            }
         }
         if ci_filled > 0 {
             log::info!("[Scan] Filled series ComicInfo defaults from file metadata for {} series (fill-blank only, #199).", ci_filled);
@@ -3430,12 +3438,20 @@ mod tests {
                "mainCharacterOrTeam" TEXT, "alternateSeries" TEXT, "alternateNumber" TEXT,
                "alternateCount" INTEGER, "storyArcNumber" TEXT, inker TEXT, editor TEXT, translator TEXT)"#,
         ).execute(&pool).await.unwrap();
-        sqlx::query(r#"CREATE TABLE "Issue" (id TEXT PRIMARY KEY, "seriesId" TEXT, "filePath" TEXT, number TEXT)"#)
+        sqlx::query(r#"CREATE TABLE "Issue" (id TEXT PRIMARY KEY, "seriesId" TEXT, "filePath" TEXT, number TEXT,
+               "attachedVolumeId" TEXT, "isAnnual" INTEGER NOT NULL DEFAULT 0)"#)
             .execute(&pool).await.unwrap();
         sqlx::query(r#"INSERT INTO "Series" (id, "libraryId") VALUES ('s233', 'lib1')"#).execute(&pool).await.unwrap();
         let cbz_str = cbz.to_string_lossy().replace('\\', "/");
-        sqlx::query(r#"INSERT INTO "Issue" (id, "seriesId", "filePath", number) VALUES ('i233', 's233', $1, '1')"#)
+        sqlx::query(r#"INSERT INTO "Issue" (id, "seriesId", "filePath", number) VALUES ('i233', 's233', $1, '500')"#)
             .bind(&cbz_str).execute(&pool).await.unwrap();
+        // An attached collected edition and an annual are Issue rows of the same series too, and
+        // number is text: "1" sorts ahead of "500". Neither is "the series' file" -- a TPB's own
+        // <Format>TPB</Format> would otherwise classify the whole run as TPB, permanently.
+        sqlx::query(r#"INSERT INTO "Issue" (id, "seriesId", "filePath", number, "attachedVolumeId") VALUES ('i_tpb', 's233', '/lib/Court of Owls TPB.cbz', '1', 'att_tpb')"#)
+            .execute(&pool).await.unwrap();
+        sqlx::query(r#"INSERT INTO "Issue" (id, "seriesId", "filePath", number, "isAnnual") VALUES ('i_ann', 's233', '/lib/Annual 001.cbz', '1', 1)"#)
+            .execute(&pool).await.unwrap();
 
         // The real candidate query: a blank bookType (among other blanks) makes this series a hit.
         let candidates = sqlx::query(comicinfo_defaults_candidates_sql()).bind("lib1").fetch_all(&pool).await.unwrap();
@@ -3521,6 +3537,11 @@ mod tests {
         assert_eq!(book_type_from_comicinfo_format("HC"), Some("TPB"));
         assert_eq!(book_type_from_comicinfo_format("Omnibus"), Some("TPB"));
         assert_eq!(book_type_from_comicinfo_format("Deluxe"), Some("TPB"));
+        // Other real spellings: ComicRack writes "Hard-Cover", Metron's series_type says "Hard Cover".
+        assert_eq!(book_type_from_comicinfo_format("Hard-Cover"), Some("TPB"));
+        assert_eq!(book_type_from_comicinfo_format("Hard Cover"), Some("TPB"));
+        assert_eq!(book_type_from_comicinfo_format("Hardback"), Some("TPB"));
+        assert_eq!(book_type_from_comicinfo_format("Original Graphic Novel"), Some("GN"));
         // An unrecognized Format (or no tag at all) is not evidence of anything specific -- stays
         // unclassified rather than defaulting to Print, same as a missing tag. `format` itself
         // always keeps the raw text regardless ("Director's Cut" is never lost).

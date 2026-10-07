@@ -662,7 +662,7 @@ async fn fetch_comicvine(
     let vol_genres_json = if vol_genres.is_empty() { None } else { serde_json::to_string(&vol_genres).ok() };
 
     // ComicVine has no format field, so book type is a conservative guess (beta.032): explicit
-    // format hints in the volume name, or a finished single-issue volume = one-shot.
+    // format hints in the volume name, or a single-issue volume at least two calendar years old.
     // NOTE: this function's own `current_year` parameter is actually the series' prior/fallback
     // year (see its use above), not today's date -- the age gate needs the real wall-clock year.
     let today_year: i32 = chrono::Utc::now().format("%Y").to_string().parse().unwrap_or(0);
@@ -1943,7 +1943,9 @@ pub(crate) fn next_match_state(existing: Option<String>) -> &'static str {
 /// Review of #233: count_of_issues == 1 alone isn't enough either -- a series that just launched
 /// has one issue because #2 hasn't been solicited yet, not because it's a one-shot, and since
 /// bookType is fill-blank-only that guess is permanent. `current_year` gates it to a volume whose
-/// start_year is at least a year old.
+/// start_year is at least two calendar years back: one year would pass a volume that launched in
+/// December and syncs in January. Leaving it unset costs nothing, since every later sync re-checks
+/// a blank.
 pub(crate) fn guess_book_type_from_cv_volume(vol_data: &serde_json::Value, current_year: i32) -> Option<&'static str> {
     static RE_GN: OnceLock<Regex> = OnceLock::new();
     static RE_TPB: OnceLock<Regex> = OnceLock::new();
@@ -1956,7 +1958,7 @@ pub(crate) fn guess_book_type_from_cv_volume(vol_data: &serde_json::Value, curre
         Some("TPB")
     } else if vol_data["count_of_issues"].as_i64() == Some(1) {
         let start_year = vol_data["start_year"].as_str().and_then(|s| s.trim().parse::<i32>().ok()).unwrap_or(0);
-        if start_year > 0 && start_year < current_year { Some("OneShot") } else { None }
+        if start_year > 0 && start_year <= current_year - 2 { Some("OneShot") } else { None }
     } else {
         None
     }
@@ -2657,9 +2659,12 @@ mod tests {
         // blank, a wrong guess here is permanent.
         let vol = serde_json::json!({"name": "Brand New Series", "count_of_issues": 1, "start_year": "2026"});
         assert_eq!(guess_book_type_from_cv_volume(&vol, 2026), None);
-        // A year old clears the gate.
+        // Last calendar year is still too recent: a December launch synced in January.
         let vol2 = serde_json::json!({"name": "Brand New Series", "count_of_issues": 1, "start_year": "2025"});
-        assert_eq!(guess_book_type_from_cv_volume(&vol2, 2026), Some("OneShot"));
+        assert_eq!(guess_book_type_from_cv_volume(&vol2, 2026), None);
+        // Two calendar years back clears the gate.
+        let vol3 = serde_json::json!({"name": "Brand New Series", "count_of_issues": 1, "start_year": "2024"});
+        assert_eq!(guess_book_type_from_cv_volume(&vol3, 2026), Some("OneShot"));
     }
 
     #[test]

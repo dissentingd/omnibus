@@ -39,8 +39,9 @@ async function getSeriesEndedCutoff(): Promise<{ cutoffMs: number, months: numbe
  * ComicVine has no format field, so book type is a conservative guess: an explicit format word in
  * the volume name, or a single-issue volume = one-shot. ComicVine leaves end_year null on nearly
  * every volume, so it can't be the "finished" signal; instead the volume must have started at
- * least a year ago, since a series that just launched also has one issue until #2 ships, and
- * bookType is only ever filled when blank. Engine twin: guess_book_type_from_cv_volume.
+ * least two calendar years back, since a series that just launched also has one issue until #2
+ * ships (one year would pass a December launch synced in January), and bookType is only ever
+ * filled when blank. Engine twin: guess_book_type_from_cv_volume.
  */
 export function guessBookTypeFromCvVolume(
     volData: { name?: string | null; count_of_issues?: number | null; start_year?: string | number | null },
@@ -51,7 +52,7 @@ export function guessBookTypeFromCvVolume(
     if (/\bTPB\b|trade paperback|\bHC\b|hardcover/i.test(volName)) return 'TPB';
     if (volData.count_of_issues === 1) {
         const startYear = parseInt(String(volData.start_year ?? ''), 10);
-        return startYear > 0 && startYear < currentYear ? 'OneShot' : null;
+        return startYear > 0 && startYear <= currentYear - 2 ? 'OneShot' : null;
     }
     return null;
 }

@@ -366,11 +366,14 @@ describe('Metadata Pipeline: ComicVine Sync Engine', () => {
 });
 
 describe('guessBookTypeFromCvVolume (engine twin)', () => {
-    it('guesses OneShot for a single-issue volume that started at least a year ago, end_year or not', () => {
+    it('guesses OneShot for a single-issue volume that started two or more calendar years back, end_year or not', () => {
         expect(guessBookTypeFromCvVolume({ name: 'Batman: The Killing Joke', count_of_issues: 1, start_year: '1988' }, 2026)).toBe('OneShot');
     });
     it('leaves a single-issue volume from this year unset: #2 may simply not be out yet', () => {
         expect(guessBookTypeFromCvVolume({ name: 'New Launch', count_of_issues: 1, start_year: '2026' }, 2026)).toBe(null);
+        // Last calendar year is still too recent (a December launch synced in January); two back clears it.
+        expect(guessBookTypeFromCvVolume({ name: 'Last Year', count_of_issues: 1, start_year: '2025' }, 2026)).toBe(null);
+        expect(guessBookTypeFromCvVolume({ name: 'Two Back', count_of_issues: 1, start_year: '2024' }, 2026)).toBe('OneShot');
         expect(guessBookTypeFromCvVolume({ name: 'No Year', count_of_issues: 1, start_year: null }, 2026)).toBe(null);
     });
     it('reads explicit format words in the name first, and guesses nothing otherwise', () => {
