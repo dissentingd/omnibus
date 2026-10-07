@@ -653,7 +653,7 @@ async fn fetch_comicvine(
     if let Some(arr) = vol_data["concepts"].as_array() {
         for c in arr {
             if let Some(n) = c["name"].as_str() {
-                if is_real_genre(n) && !vol_genres.contains(&n.to_string()) {
+                if !n.is_empty() && !is_genre_noise(n) && !vol_genres.contains(&n.to_string()) {
                     vol_genres.push(n.to_string());
                 }
             }
@@ -681,6 +681,29 @@ async fn fetch_comicvine(
     };
 
     let final_cover = resolve_cover(client, image_url.as_deref(), folder_path, current_cover, has_custom_cover, cover_source).await;
+
+    // Genre noise an earlier sync stored stays forever otherwise: the writes below only fill a blank
+    // (or skip an empty list). Removing noise only ever takes junk out, so it applies in every mode
+    // and to a locked series too. Done first, so a list that was all noise refills from the
+    // filtered volume list in this same sync.
+    let stored_genres: Option<String> = sqlx::query_scalar(r#"SELECT genres FROM "Series" WHERE id = $1"#)
+        .bind(series_id)
+        .fetch_optional(&db.pool)
+        .await
+        .ok()
+        .flatten()
+        .flatten();
+    let cleaned_genres = strip_genre_noise_json(stored_genres.clone());
+    if cleaned_genres != stored_genres {
+        if let Err(e) = sqlx::query(r#"UPDATE "Series" SET genres = $1 WHERE id = $2"#)
+            .bind(&cleaned_genres)
+            .bind(series_id)
+            .execute(&db.pool)
+            .await
+        {
+            log::warn!("[Metadata] Failed to strip genre noise from series {}: {:?}", series_name, e);
+        }
+    }
 
     // remoteCoverUrl keeps the original provider URL for external consumers (series.json) —
     // coverUrl becomes a local path. The bookType heuristic only fills a blank (never clobbers
@@ -960,7 +983,9 @@ async fn fetch_comicvine(
             let desc_val = prefer_existing(existing_desc, cv_desc.clone(), is_locked, file_priority);
             // A custom issue cover (set in the Smart Matcher) survives every sync; else the provider's wins.
             let cover_val = if has_custom_cover { existing_cover } else { cv_cover.clone() };
-            // When locked keep existing genres; otherwise only (re)write when the volume has them and the issue doesn't yet.
+            // When locked keep existing genres; otherwise strip stored noise, then only (re)write when
+            // the volume has them and the issue doesn't (a list that was all noise counts as blank).
+            let existing_genres = if is_locked { existing_genres } else { strip_genre_noise_json(existing_genres) };
             let genres_val = if is_locked {
                 existing_genres
             } else if vol_genres_json.is_some() && existing_genres.is_none() {
@@ -1938,18 +1963,26 @@ pub(crate) fn is_cv_rate_limited(status: reqwest::StatusCode) -> bool {
     status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.as_u16() == 420
 }
 
-/// ComicVine "concepts" are a free-form tag cloud ("Variant Cover: Action Figure", "Homage Covers",
-/// event and character-trait tags), not genres. Only a concept that is a recognised genre name is
-/// promoted to Series/Issue genres; everything else would pollute <Genre> in every embedded file.
-/// EXACT twin: src/lib/utils.ts isRealGenre.
-pub(crate) fn is_real_genre(name: &str) -> bool {
-    const GENRES: &[&str] = &[
-        "action", "adventure", "alternate history", "anthology", "biography", "comedy", "crime",
-        "cyberpunk", "drama", "espionage", "fantasy", "historical", "horror", "humor", "mystery",
-        "noir", "post-apocalyptic", "romance", "satire", "science fiction", "slice of life",
-        "sports", "superhero", "supernatural", "survival", "thriller", "war", "western", "zombies",
-    ];
-    GENRES.contains(&name.trim().to_ascii_lowercase().as_str())
+/// ComicVine "concepts" mix real genres and useful non-genre concepts (Time Travel, Martial Arts)
+/// with cover/variant tags ("Variant Cover: Action Figure", "Variant Theme: Civil War", "Homage
+/// Covers", "Marvel 25th Anniversary Frame Covers") that have no business in <Genre>. Those
+/// families are dropped; every other concept is kept. EXACT twin: src/lib/utils.ts isGenreNoise.
+pub(crate) fn is_genre_noise(name: &str) -> bool {
+    let n = name.trim().to_ascii_lowercase();
+    n.starts_with("variant ") || n.ends_with(" cover") || n.ends_with(" covers")
+}
+
+/// A stored genres JSON array with the noise entries removed; None when nothing else is left. A
+/// value that isn't a JSON string array, or holds no noise, comes back unchanged.
+/// EXACT twin: src/lib/utils.ts stripGenreNoise.
+pub(crate) fn strip_genre_noise_json(stored: Option<String>) -> Option<String> {
+    let s = stored?;
+    let Ok(list) = serde_json::from_str::<Vec<String>>(&s) else { return Some(s) };
+    if !list.iter().any(|g| is_genre_noise(g)) {
+        return Some(s);
+    }
+    let kept: Vec<String> = list.into_iter().filter(|g| !is_genre_noise(g)).collect();
+    if kept.is_empty() { None } else { serde_json::to_string(&kept).ok() }
 }
 
 /// Match-state a sync upsert should write: an issue the view-time lazy enrichment already deep-
@@ -2183,12 +2216,32 @@ mod tests {
     }
 
     #[test]
-    fn is_real_genre_rejects_cv_concept_noise() {
-        assert!(is_real_genre("Superhero"));
-        assert!(is_real_genre(" science fiction "));
-        assert!(!is_real_genre("Variant Cover: Action Figure"));
-        assert!(!is_real_genre("Homage Covers"));
-        assert!(!is_real_genre(""));
+    fn genre_noise_is_the_cover_and_variant_families_only() {
+        assert!(is_genre_noise("Variant Cover: Action Figure"));
+        assert!(is_genre_noise("Variant Theme: Civil War"));
+        assert!(is_genre_noise("Variant Exclusive: Marvel Unlimited"));
+        assert!(is_genre_noise(" variant artist: x "));
+        assert!(is_genre_noise("Homage Cover"));
+        assert!(is_genre_noise("Homage Covers"));
+        assert!(is_genre_noise("Marvel 25th Anniversary Frame Covers"));
+        // Real genres and useful non-genre concepts stay.
+        for keep in ["Superhero", "Science Fiction", "Time Travel", "Alternate Reality", "Martial Arts", "Variants", "Undercover", ""] {
+            assert!(!is_genre_noise(keep), "{keep}");
+        }
+    }
+
+    #[test]
+    fn strip_genre_noise_json_cleans_stored_lists() {
+        assert_eq!(
+            strip_genre_noise_json(Some(r#"["Superhero","Variant Cover: Photo","Time Travel","Homage Covers"]"#.to_string())),
+            Some(r#"["Superhero","Time Travel"]"#.to_string())
+        );
+        // All noise: nothing real left, so it reads as blank and the fill takes the filtered list.
+        assert_eq!(strip_genre_noise_json(Some(r#"["Variant Theme: Civil War"]"#.to_string())), None);
+        // No noise, or not a JSON list: untouched, byte for byte.
+        assert_eq!(strip_genre_noise_json(Some(r#"["Horror", "Crime"]"#.to_string())), Some(r#"["Horror", "Crime"]"#.to_string()));
+        assert_eq!(strip_genre_noise_json(Some("Horror, Crime".to_string())), Some("Horror, Crime".to_string()));
+        assert_eq!(strip_genre_noise_json(None), None);
     }
 
     // ==== Issue #194: two concurrent syncs of the same series interleave non-idempotent issue
