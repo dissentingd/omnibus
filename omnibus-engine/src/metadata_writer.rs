@@ -834,10 +834,16 @@ fn top_level_elements(xml: &str) -> Vec<(String, String, bool)> {
 /// so the embed doesn't need to independently defend them against the DB a second time; doing so
 /// previously froze bad provider values in permanently and blocked legitimate admin/provider
 /// updates from ever reaching an already-tagged file. An unparseable/missing existing ComicInfo
-/// falls back to `generated` unchanged.
+/// falls back to `generated` unchanged, and so does a merge whose output isn't well-formed XML, so
+/// a bad merge can never reach a file.
 pub(crate) fn merge_comicinfo(generated: &str, existing: &str) -> String {
+    // The same clean-up the scanner applies on read: .NET taggers (ComicRack) write a byte-order
+    // mark, which quick-xml skips without counting it in buffer_position(), so every slice below
+    // would start 3 bytes early; and a bare `&` (`<Notes>Tom & Jerry</Notes>`) stops the parse,
+    // silently dropping every carried tag after it.
+    let existing = crate::scanner::sanitize_xml_ampersands(existing.trim_start_matches('\u{feff}'));
     let gen_elems = top_level_elements(generated);
-    let old_elems = top_level_elements(existing);
+    let old_elems = top_level_elements(&existing);
     if gen_elems.is_empty() || old_elems.is_empty() {
         return generated.to_string();
     }
@@ -866,7 +872,37 @@ pub(crate) fn merge_comicinfo(generated: &str, existing: &str) -> String {
     }
     out.push('\n');
     out.push_str(&generated[root_close..]);
+    if !is_well_formed_xml(&out) {
+        log::warn!("[Writer] Merged ComicInfo.xml was not well-formed; writing Omnibus's own XML without the carried-over tags.");
+        return generated.to_string();
+    }
     out
+}
+
+/// True when `xml` parses start to end with every element closed. The merge's last line of defence.
+fn is_well_formed_xml(xml: &str) -> bool {
+    use quick_xml::events::Event;
+    let mut reader = quick_xml::Reader::from_str(xml);
+    let mut depth = 0usize;
+    let mut saw_root = false;
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(_)) => {
+                depth += 1;
+                saw_root = true;
+            }
+            Ok(Event::Empty(_)) => saw_root = true,
+            Ok(Event::End(_)) => {
+                if depth == 0 {
+                    return false;
+                }
+                depth -= 1;
+            }
+            Ok(Event::Eof) => return saw_root && depth == 0,
+            Err(_) => return false,
+            _ => {}
+        }
+    }
 }
 
 /// Rewrites the ZIP to include the new ComicInfo.xml, preserving the source compression of every entry.
@@ -1148,7 +1184,7 @@ mod tests {
             zw.start_file("01.jpg", FileOptions::default()).unwrap();
             zw.write_all(&[0xFF, 0xD8, 0xFF, 0xE0]).unwrap();
             zw.start_file("ComicInfo.xml", FileOptions::default()).unwrap();
-            zw.write_all(br#"<?xml version="1.0"?><ComicInfo><Series>Old Name</Series><Summary>file summary</Summary><Count>6</Count><PageCount>17</PageCount><Pages><Page Image="0" Type="FrontCover" /><Page Image="1" /></Pages></ComicInfo>"#).unwrap();
+            zw.write_all(br#"<?xml version="1.0"?><ComicInfo><Series>Old Name</Series><Title>Old file title</Title><Summary>file summary</Summary><Count>6</Count><PageCount>17</PageCount><Pages><Page Image="0" Type="FrontCover" /><Page Image="1" /></Pages></ComicInfo>"#).unwrap();
             zw.finish().unwrap();
         };
 
@@ -1209,6 +1245,11 @@ mod tests {
             assert!(xml.contains(r#"<Page Image="1" />"#), "Pages block survives, file_metadata_priority={file_priority}:\n{xml}");
             assert!(xml.contains("<Series>Nick Fury</Series>"), "an Omnibus-modeled tag always takes the DB value, file_metadata_priority={file_priority}:\n{xml}");
             assert!(xml.contains("<Summary>provider summary</Summary>"), "a modeled tag is never defended against the DB, file_metadata_priority={file_priority}:\n{xml}");
+            // A modeled field that's blank in the DB clears the file's old value instead of reviving
+            // it: the builder writes every tag it models, empty ones included, so the merge never
+            // carries the file's <Title> over.
+            assert!(!xml.contains("Old file title"), "a blank DB title clears the file's, file_metadata_priority={file_priority}:\n{xml}");
+            assert!(xml.contains("<Title></Title>"), "file_metadata_priority={file_priority}:\n{xml}");
 
             let _ = std::fs::remove_dir_all(&base);
         }
@@ -1410,6 +1451,41 @@ mod tests {
         assert_eq!(get("PageCount").unwrap(), "<PageCount>17</PageCount>");
         assert!(get("Pages").unwrap().contains(r#"<Page Image="1" />"#), "Pages block survives verbatim");
         assert_eq!(merge_comicinfo(GEN, &m), m, "merging is idempotent (unchanged files are not repacked)");
+    }
+
+    #[test]
+    fn merge_handles_a_bom_prefixed_crlf_comicinfo() {
+        // ComicRack and other .NET taggers write a byte-order mark (and CRLF). Unstripped, every
+        // slice came out 3 bytes early: "<Count>6</Cou", "</Pag", and a file nothing could read.
+        let old = "\u{feff}<?xml version=\"1.0\"?>\r\n<ComicInfo>\r\n  <Series>Old Name</Series>\r\n  <Count>6</Count>\r\n  <PageCount>17</PageCount>\r\n  <Pages>\r\n    <Page Image=\"0\" Type=\"FrontCover\" />\r\n    <Page Image=\"1\" />\r\n  </Pages>\r\n</ComicInfo>";
+        let m = merge_comicinfo(GEN, old);
+        assert!(is_well_formed_xml(&m), "merged output must parse:\n{m}");
+        let tags = top_level_elements(&m);
+        let get = |n: &str| tags.iter().find(|(name, _, _)| name == n).map(|(_, r, _)| r.clone());
+        assert_eq!(get("Count").unwrap(), "<Count>6</Count>");
+        assert_eq!(get("PageCount").unwrap(), "<PageCount>17</PageCount>");
+        assert!(get("Pages").unwrap().ends_with("</Pages>"));
+        assert!(get("Pages").unwrap().contains(r#"<Page Image="1" />"#));
+        assert_eq!(get("Series").unwrap(), "<Series>Nick Fury</Series>");
+    }
+
+    #[test]
+    fn merge_survives_a_bare_ampersand_ahead_of_carried_tags() {
+        // Unsanitised, the `&` stops the parse and every carried tag after it is silently dropped.
+        let old = "<?xml version=\"1.0\"?><ComicInfo><Notes>Tom & Jerry</Notes><Count>6</Count><PageCount>17</PageCount></ComicInfo>";
+        let m = merge_comicinfo(GEN, old);
+        assert!(is_well_formed_xml(&m), "merged output must parse:\n{m}");
+        assert!(m.contains("<Count>6</Count>"), "{m}");
+        assert!(m.contains("<PageCount>17</PageCount>"), "{m}");
+    }
+
+    #[test]
+    fn well_formed_check_rejects_truncated_or_mismatched_xml() {
+        assert!(is_well_formed_xml(GEN));
+        assert!(!is_well_formed_xml("<ComicInfo><Count>6</Cou"));
+        assert!(!is_well_formed_xml("<ComicInfo><Count>6</Count><Pages></Pag"));
+        assert!(!is_well_formed_xml("<ComicInfo><Count>6</PageCount></ComicInfo>"));
+        assert!(!is_well_formed_xml(""));
     }
 
     #[test]
